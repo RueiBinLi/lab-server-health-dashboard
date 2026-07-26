@@ -1,0 +1,1 @@
+"""Lab Server Health dashboard."""
