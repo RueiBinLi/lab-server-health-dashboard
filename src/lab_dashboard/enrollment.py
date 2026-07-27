@@ -142,6 +142,15 @@ class InvalidRegistration(Exception):
     pass
 
 
+def parse_scrape_address(value: object) -> str:
+    if not isinstance(value, str):
+        raise InvalidRegistration
+    address = value.strip()
+    if not _printable(address) or not _valid_private_scrape_address(address):
+        raise InvalidRegistration
+    return address
+
+
 class InvalidFirstContact(Exception):
     pass
 
@@ -163,7 +172,7 @@ def parse_registration(document: object) -> Registration:
         raise InvalidRegistration
 
     display_name = document["displayName"].strip()
-    scrape_address = document["scrapeAddress"].strip()
+    scrape_address = parse_scrape_address(document["scrapeAddress"])
     profile_id = document["profileId"].strip()
     reason = document["reason"].strip()
     if (
@@ -172,8 +181,6 @@ def parse_registration(document: object) -> Registration:
         or not 1 <= len(profile_id) <= 100
         or not 1 <= len(reason) <= 500
         or not _printable(reason)
-        or not _printable(scrape_address)
-        or not _valid_private_scrape_address(scrape_address)
     ):
         raise InvalidRegistration
     return Registration(

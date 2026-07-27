@@ -153,6 +153,7 @@ class RegisteredServer:
     pending_profile_configuration: PendingProfileConfiguration | None = None
     pending_inventory_change: ServerInventory | None = None
     active_configuration_hash: str | None = None
+    certificate_expires_at: datetime | None = None
 
 
 def profile_persistent_mountpoints(
@@ -224,6 +225,19 @@ def profile_threshold_overrides(
     )
 
 
+def certificate_expiry_warning_days(
+    server: RegisteredServer,
+) -> int | None:
+    if server.certificate_expires_at is None:
+        return None
+    remaining = server.certificate_expires_at - _now()
+    remaining_days = max(0, (remaining.days + (remaining.seconds > 0)))
+    for warning_day in (1, 3, 7):
+        if remaining_days <= warning_day:
+            return warning_day
+    return None
+
+
 class DisplayNameConflict(Exception):
     pass
 
@@ -253,6 +267,14 @@ class StagedProfileVerificationFailed(Exception):
 
 
 class ServerNotAwaitingFirstContact(Exception):
+    pass
+
+
+class CollectorLifecycleConflict(Exception):
+    pass
+
+
+class CollectorRenewalNotDue(Exception):
     pass
 
 
@@ -354,12 +376,47 @@ def initialize_database(path: Path) -> None:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS collector_certificate_history (
+                    collector_public_key_fingerprint TEXT PRIMARY KEY,
+                    server_id TEXT NOT NULL REFERENCES servers(server_id),
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    end_reason TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO collector_certificate_history (
+                    collector_public_key_fingerprint, server_id,
+                    issued_at, expires_at
+                )
+                SELECT collector_public_key_fingerprint, server_id,
+                       expires_at, expires_at
+                FROM collector_certificates
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS staging_scrape_targets (
                     server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
                     scrape_address TEXT NOT NULL,
                     added_at TEXT NOT NULL,
                     scrape_client_certificate_path TEXT NOT NULL,
                     scrape_client_key_path TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_scrape_address_changes (
+                    server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
+                    scrape_address TEXT NOT NULL,
+                    expected_collector_fingerprint TEXT NOT NULL,
+                    staged_at TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL
                 )
                 """
             )
@@ -1723,7 +1780,8 @@ def issue_bootstrap_token(
             ).fetchone()
             if (
                 server is None
-                or server["enrollment_state"] != "awaiting-first-contact"
+                or server["enrollment_state"]
+                not in ("awaiting-first-contact", "re-enrollment-required")
             ):
                 raise ServerNotAwaitingFirstContact
             connection.execute(
@@ -1750,6 +1808,18 @@ def issue_bootstrap_token(
         dict[str, object], profile_definition["capabilities"]
     )
     return token, expires_at, capabilities.get("gpu") is True
+
+
+def server_accepts_bootstrap(path: Path, *, server_id: str) -> bool:
+    with closing(_connect(path)) as connection:
+        server = connection.execute(
+            "SELECT enrollment_state FROM servers WHERE server_id = ?",
+            (server_id,),
+        ).fetchone()
+    return server is not None and server["enrollment_state"] in (
+        "awaiting-first-contact",
+        "re-enrollment-required",
+    )
 
 
 def consume_bootstrap_token(
@@ -1816,7 +1886,8 @@ def consume_bootstrap_token(
         ).fetchone()
         if (
             server is None
-            or server["enrollment_state"] != "awaiting-first-contact"
+            or server["enrollment_state"]
+            not in ("awaiting-first-contact", "re-enrollment-required")
         ):
             connection.rollback()
             raise InvalidBootstrapCredentials
@@ -1837,6 +1908,20 @@ def consume_bootstrap_token(
             (
                 server_id,
                 collector_public_key_fingerprint,
+                certificate_expires_at.isoformat(),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO collector_certificate_history (
+                collector_public_key_fingerprint, server_id,
+                issued_at, expires_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                collector_public_key_fingerprint,
+                server_id,
+                occurred_at.isoformat(),
                 certificate_expires_at.isoformat(),
             ),
         )
@@ -2011,6 +2096,7 @@ def list_registered_servers(path: Path) -> list[RegisteredServer]:
             SELECT
                 s.server_id, s.display_name, s.scrape_address,
                 s.enrollment_state, s.active_configuration_hash,
+                cc.expires_at AS certificate_expires_at,
                 p.profile_id, p.revision, p.name,
                 p.state, p.definition_json,
                 pe.source_address, pe.inventory_json AS pending_inventory_json,
@@ -2039,6 +2125,8 @@ def list_registered_servers(path: Path) -> list[RegisteredServer]:
              AND p.revision = s.profile_revision
             LEFT JOIN pending_enrollments AS pe
               ON pe.server_id = s.server_id
+            LEFT JOIN collector_certificates AS cc
+              ON cc.server_id = s.server_id
             LEFT JOIN verified_server_inventory AS vi
               ON vi.server_id = s.server_id
             LEFT JOIN revoked_collector_fingerprints AS rejected
@@ -2104,9 +2192,577 @@ def list_registered_servers(path: Path) -> list[RegisteredServer]:
                 else None
             ),
             active_configuration_hash=row["active_configuration_hash"],
+            certificate_expires_at=(
+                datetime.fromisoformat(row["certificate_expires_at"])
+                if row["certificate_expires_at"] is not None
+                else None
+            ),
         )
         for row in rows
     ]
+
+
+def revoke_collector_certificate(
+    path: Path, *, server_id: str, actor: str, reason: str
+) -> RegisteredServer:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        certificate = connection.execute(
+            """
+            SELECT collector_public_key_fingerprint
+            FROM collector_certificates WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        state = connection.execute(
+            "SELECT enrollment_state FROM servers WHERE server_id = ?",
+            (server_id,),
+        ).fetchone()
+        if (
+            certificate is None
+            or state is None
+            or state["enrollment_state"] != "active"
+        ):
+            connection.rollback()
+            raise CollectorLifecycleConflict
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO revoked_collector_fingerprints (
+                collector_public_key_fingerprint, server_id,
+                revoked_at, actor, reason
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                certificate["collector_public_key_fingerprint"],
+                server_id,
+                occurred_at.isoformat(),
+                actor,
+                reason,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM collector_certificates WHERE server_id = ?",
+            (server_id,),
+        )
+        connection.execute(
+            "DELETE FROM active_scrape_targets WHERE server_id = ?",
+            (server_id,),
+        )
+        connection.execute(
+            """
+            UPDATE collector_certificate_history
+            SET ended_at = ?, end_reason = 'revoked'
+            WHERE collector_public_key_fingerprint = ?
+            """,
+            (
+                occurred_at.isoformat(),
+                certificate["collector_public_key_fingerprint"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE servers SET enrollment_state = 're-enrollment-required'
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action="collector-certificate-revoked",
+            server_id=server_id,
+            reason=reason,
+            result="succeeded",
+        )
+        connection.commit()
+    return _require_registered_server(path, server_id)
+
+
+def renew_collector_certificate(
+    path: Path,
+    *,
+    server_id: str,
+    current_fingerprint: str,
+    new_fingerprint: str,
+    expires_at: datetime,
+) -> None:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = connection.execute(
+            """
+            SELECT collector_public_key_fingerprint, expires_at
+            FROM collector_certificates
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["collector_public_key_fingerprint"]
+            != current_fingerprint
+        ):
+            connection.rollback()
+            raise CollectorLifecycleConflict
+        if datetime.fromisoformat(current["expires_at"]) - occurred_at > (
+            timedelta(days=10)
+        ):
+            connection.rollback()
+            raise CollectorRenewalNotDue
+        connection.execute(
+            """
+            UPDATE collector_certificate_history
+            SET ended_at = ?, end_reason = 'renewed'
+            WHERE collector_public_key_fingerprint = ?
+            """,
+            (occurred_at.isoformat(), current_fingerprint),
+        )
+        connection.execute(
+            """
+            UPDATE collector_certificates
+            SET collector_public_key_fingerprint = ?, expires_at = ?
+            WHERE server_id = ?
+            """,
+            (new_fingerprint, expires_at.isoformat(), server_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO collector_certificate_history (
+                collector_public_key_fingerprint, server_id,
+                issued_at, expires_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                new_fingerprint,
+                server_id,
+                occurred_at.isoformat(),
+                expires_at.isoformat(),
+            ),
+        )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor="collector-mtls",
+            action="collector-certificate-renewed",
+            server_id=server_id,
+            reason="Automatic renewal with current collector identity",
+            result="succeeded",
+        )
+        connection.commit()
+
+
+def rotate_collector_certificate(
+    path: Path,
+    *,
+    server_id: str,
+    new_fingerprint: str,
+    expires_at: datetime,
+    actor: str,
+    reason: str,
+) -> datetime:
+    occurred_at = _now()
+    overlap_ends_at = occurred_at + timedelta(hours=24)
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = connection.execute(
+            """
+            SELECT collector_public_key_fingerprint
+            FROM collector_certificates WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        if current is None:
+            connection.rollback()
+            raise CollectorLifecycleConflict
+        connection.execute(
+            """
+            UPDATE collector_certificate_history
+            SET ended_at = ?, end_reason = 'planned-rotation-overlap'
+            WHERE collector_public_key_fingerprint = ?
+            """,
+            (
+                overlap_ends_at.isoformat(),
+                current["collector_public_key_fingerprint"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE collector_certificates
+            SET collector_public_key_fingerprint = ?, expires_at = ?
+            WHERE server_id = ?
+            """,
+            (new_fingerprint, expires_at.isoformat(), server_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO collector_certificate_history (
+                collector_public_key_fingerprint, server_id,
+                issued_at, expires_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                new_fingerprint,
+                server_id,
+                occurred_at.isoformat(),
+                expires_at.isoformat(),
+            ),
+        )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action="collector-certificate-rotated",
+            server_id=server_id,
+            reason=reason,
+            result="24-hour-credential-overlap",
+        )
+        connection.commit()
+    return overlap_ends_at
+
+
+def collector_renewal_is_due(
+    path: Path, *, server_id: str, current_fingerprint: str
+) -> bool:
+    with closing(_connect(path)) as connection:
+        current = connection.execute(
+            """
+            SELECT collector_public_key_fingerprint, expires_at
+            FROM collector_certificates
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+    if (
+        current is None
+        or current["collector_public_key_fingerprint"]
+        != current_fingerprint
+    ):
+        raise CollectorLifecycleConflict
+    return datetime.fromisoformat(current["expires_at"]) - _now() <= (
+        timedelta(days=10)
+    )
+
+
+def expire_collector_certificates(path: Path) -> None:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        with connection:
+            expired = connection.execute(
+                """
+                SELECT server_id, collector_public_key_fingerprint
+                FROM collector_certificates
+                WHERE expires_at <= ?
+                """,
+                (occurred_at.isoformat(),),
+            ).fetchall()
+            for certificate in expired:
+                connection.execute(
+                    """
+                    UPDATE servers
+                    SET enrollment_state = 're-enrollment-required'
+                    WHERE server_id = ? AND enrollment_state = 'active'
+                    """,
+                    (certificate["server_id"],),
+                )
+                connection.execute(
+                    """
+                    UPDATE collector_certificate_history
+                    SET ended_at = ?, end_reason = 'expired'
+                    WHERE collector_public_key_fingerprint = ?
+                    """,
+                    (
+                        occurred_at.isoformat(),
+                        certificate["collector_public_key_fingerprint"],
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM collector_certificates WHERE server_id = ?",
+                    (certificate["server_id"],),
+                )
+                _insert_audit_event(
+                    connection,
+                    occurred_at=occurred_at.isoformat(),
+                    actor="certificate-lifecycle",
+                    action="collector-certificate-expired",
+                    server_id=certificate["server_id"],
+                    reason="Collector certificate reached its expiry",
+                    result="re-enrollment-required",
+                )
+
+
+def stage_scrape_address_change(
+    path: Path,
+    *,
+    server_id: str,
+    scrape_address: str,
+    expected_fingerprint: str,
+    actor: str,
+    reason: str,
+) -> None:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = connection.execute(
+            """
+            SELECT collector_public_key_fingerprint
+            FROM collector_certificates WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["collector_public_key_fingerprint"]
+            != expected_fingerprint
+        ):
+            connection.rollback()
+            raise CollectorLifecycleConflict
+        connection.execute(
+            """
+            INSERT INTO pending_scrape_address_changes (
+                server_id, scrape_address, expected_collector_fingerprint,
+                staged_at, actor, reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(server_id) DO UPDATE SET
+                scrape_address = excluded.scrape_address,
+                expected_collector_fingerprint =
+                    excluded.expected_collector_fingerprint,
+                staged_at = excluded.staged_at,
+                actor = excluded.actor,
+                reason = excluded.reason
+            """,
+            (
+                server_id,
+                scrape_address,
+                expected_fingerprint,
+                occurred_at.isoformat(),
+                actor,
+                reason,
+            ),
+        )
+        staged = connection.execute(
+            """
+            INSERT INTO staging_scrape_targets (
+                server_id, scrape_address, added_at,
+                scrape_client_certificate_path, scrape_client_key_path
+            )
+            SELECT server_id, ?, ?, scrape_client_certificate_path,
+                   scrape_client_key_path
+            FROM active_scrape_targets WHERE server_id = ?
+            ON CONFLICT(server_id) DO UPDATE SET
+                scrape_address = excluded.scrape_address,
+                added_at = excluded.added_at
+            """,
+            (scrape_address, occurred_at.isoformat(), server_id),
+        )
+        if staged.rowcount != 1:
+            connection.rollback()
+            raise CollectorLifecycleConflict
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action="scrape-address-change-staged",
+            server_id=server_id,
+            reason=reason,
+            result="pending-fingerprint-verification",
+        )
+        connection.commit()
+
+
+def activate_scrape_address_change(
+    path: Path,
+    *,
+    server_id: str,
+    observed_fingerprint: str,
+    actor: str,
+) -> RegisteredServer:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        pending = connection.execute(
+            """
+            SELECT scrape_address, expected_collector_fingerprint, reason
+            FROM pending_scrape_address_changes WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        if (
+            pending is None
+            or pending["expected_collector_fingerprint"]
+            != observed_fingerprint
+        ):
+            connection.rollback()
+            raise CollectorLifecycleConflict
+        connection.execute(
+            """
+            UPDATE servers SET scrape_address = ? WHERE server_id = ?
+            """,
+            (pending["scrape_address"], server_id),
+        )
+        connection.execute(
+            """
+            UPDATE active_scrape_targets SET scrape_address = ?,
+                activated_at = ? WHERE server_id = ?
+            """,
+            (
+                pending["scrape_address"],
+                occurred_at.isoformat(),
+                server_id,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM staging_scrape_targets WHERE server_id = ?",
+            (server_id,),
+        )
+        connection.execute(
+            "DELETE FROM pending_scrape_address_changes WHERE server_id = ?",
+            (server_id,),
+        )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action="scrape-address-changed",
+            server_id=server_id,
+            reason=pending["reason"],
+            result="fingerprint-verified-and-activated",
+        )
+        connection.commit()
+    return _require_registered_server(path, server_id)
+
+
+def recover_compromised_intermediate(
+    path: Path, *, actor: str, reason: str
+) -> int:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        certificates = connection.execute(
+            """
+            SELECT server_id, collector_public_key_fingerprint
+            FROM collector_certificates
+            """
+        ).fetchall()
+        for certificate in certificates:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO revoked_collector_fingerprints (
+                    collector_public_key_fingerprint, server_id,
+                    revoked_at, actor, reason
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    certificate["collector_public_key_fingerprint"],
+                    certificate["server_id"],
+                    occurred_at.isoformat(),
+                    actor,
+                    reason,
+                ),
+            )
+        connection.execute(
+            """
+            UPDATE collector_certificate_history
+            SET ended_at = ?, end_reason = 'intermediate-ca-compromise'
+            WHERE ended_at IS NULL
+            """,
+            (occurred_at.isoformat(),),
+        )
+        connection.execute(
+            """
+            UPDATE servers SET enrollment_state = 're-enrollment-required'
+            WHERE enrollment_state IN ('active', 'pending-verification')
+            """
+        )
+        connection.execute("DELETE FROM collector_certificates")
+        connection.execute("DELETE FROM staging_scrape_targets")
+        connection.execute("DELETE FROM active_scrape_targets")
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action="intermediate-ca-recovery-started",
+            server_id=None,
+            reason=reason,
+            result=f"{len(certificates)}-servers-re-enrollment-required",
+        )
+        connection.commit()
+    return len(certificates)
+
+
+def retire_server(
+    path: Path, *, server_id: str, actor: str, reason: str
+) -> RegisteredServer:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        state = connection.execute(
+            "SELECT enrollment_state FROM servers WHERE server_id = ?",
+            (server_id,),
+        ).fetchone()
+        if state is None or state["enrollment_state"] == "retired":
+            connection.rollback()
+            raise CollectorLifecycleConflict
+        certificate = connection.execute(
+            """
+            SELECT collector_public_key_fingerprint
+            FROM collector_certificates WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        if certificate is not None:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO revoked_collector_fingerprints (
+                    collector_public_key_fingerprint, server_id,
+                    revoked_at, actor, reason
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    certificate["collector_public_key_fingerprint"],
+                    server_id,
+                    occurred_at.isoformat(),
+                    actor,
+                    reason,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE collector_certificate_history
+                SET ended_at = ?, end_reason = 'server-retired'
+                WHERE collector_public_key_fingerprint = ?
+                """,
+                (
+                    occurred_at.isoformat(),
+                    certificate["collector_public_key_fingerprint"],
+                ),
+            )
+        for table in (
+            "collector_certificates",
+            "staging_scrape_targets",
+            "active_scrape_targets",
+            "pending_enrollments",
+            "pending_scrape_address_changes",
+        ):
+            connection.execute(
+                f"DELETE FROM {table} WHERE server_id = ?", (server_id,)
+            )
+        connection.execute(
+            "UPDATE servers SET enrollment_state = 'retired' WHERE server_id = ?",
+            (server_id,),
+        )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action="server-retired",
+            server_id=server_id,
+            reason=reason,
+            result="succeeded",
+        )
+        connection.commit()
+    return _require_registered_server(path, server_id)
 
 
 def get_staging_observation_target(
@@ -2380,6 +3036,9 @@ def _approve_pending_enrollment(
         INSERT INTO verified_server_inventory (
             server_id, inventory_json, verified_at
         ) VALUES (?, ?, ?)
+        ON CONFLICT(server_id) DO UPDATE SET
+            inventory_json = excluded.inventory_json,
+            verified_at = excluded.verified_at
         """,
         (server_id, pending["inventory_json"], occurred_at.isoformat()),
     )
@@ -2394,6 +3053,12 @@ def _approve_pending_enrollment(
             scrape_client_certificate_path, scrape_client_key_path
         FROM staging_scrape_targets
         WHERE server_id = ?
+        ON CONFLICT(server_id) DO UPDATE SET
+            scrape_address = excluded.scrape_address,
+            activated_at = excluded.activated_at,
+            scrape_client_certificate_path =
+                excluded.scrape_client_certificate_path,
+            scrape_client_key_path = excluded.scrape_client_key_path
         """,
         (occurred_at.isoformat(), server_id),
     )

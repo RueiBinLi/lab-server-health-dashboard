@@ -7,6 +7,7 @@ from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -14,6 +15,8 @@ from lab_dashboard.auth import Role, Viewer, authorize
 from lab_dashboard.config import DashboardConfig
 from lab_dashboard.database import (
     BOOTSTRAP_TOKEN_TTL_SECONDS,
+    CollectorLifecycleConflict,
+    CollectorRenewalNotDue,
     ConfigurationHashMismatch,
     DisplayNameConflict,
     EnrollmentDecisionConflict,
@@ -31,11 +34,15 @@ from lab_dashboard.database import (
     ServerNotAwaitingFirstContact,
     VerificationCodeMismatch,
     activate_staged_profile_configuration,
+    activate_scrape_address_change,
     accept_inventory_change,
     clone_profile,
+    certificate_expiry_warning_days,
+    collector_renewal_is_due,
     consume_bootstrap_token,
     create_profile_draft,
     decide_enrollment,
+    expire_collector_certificates,
     get_staging_observation_target,
     initialize_database,
     issue_bootstrap_token,
@@ -56,10 +63,17 @@ from lab_dashboard.database import (
     record_failed_registration,
     record_inventory_observation,
     record_staged_observations,
+    recover_compromised_intermediate,
+    renew_collector_certificate,
     register_server,
+    retire_server,
     retire_profile,
+    rotate_collector_certificate,
+    revoke_collector_certificate,
     server_requires_nvidia,
+    server_accepts_bootstrap,
     server_scrape_address,
+    stage_scrape_address_change,
     stage_profile_configuration,
     staged_profile_configuration,
     validate_bootstrap_token,
@@ -72,6 +86,7 @@ from lab_dashboard.enrollment import (
     parse_enrollment_decision,
     parse_first_contact,
     parse_registration,
+    parse_scrape_address,
     safe_audit_reason,
     server_inventory_from_document,
 )
@@ -337,6 +352,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/api/enrollment/requirements":
             self._send_enrollment_requirements()
             return
+        if self.path == "/api/trust/intermediate-recovery":
+            self._recover_intermediate_ca()
+            return
+        collector_prefix = "/api/collectors/"
+        renewal_suffix = "/certificate-renewals"
+        if self.path.startswith(collector_prefix) and self.path.endswith(
+            renewal_suffix
+        ):
+            server_id = self.path[
+                len(collector_prefix) : -len(renewal_suffix)
+            ]
+            self._renew_collector_certificate(server_id)
+            return
         prefix = "/api/servers/"
         acknowledgment_suffix = "/critical-error-acknowledgments"
         if self.path.startswith(prefix) and self.path.endswith(
@@ -386,6 +414,43 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             ]
             self._accept_inventory_change(server_id)
             return
+        revocation_suffix = "/certificate-revocations"
+        if self.path.startswith(prefix) and self.path.endswith(
+            revocation_suffix
+        ):
+            server_id = self.path[len(prefix) : -len(revocation_suffix)]
+            self._revoke_collector_certificate(server_id)
+            return
+        rotation_suffix = "/certificate-rotations"
+        if self.path.startswith(prefix) and self.path.endswith(
+            rotation_suffix
+        ):
+            server_id = self.path[len(prefix) : -len(rotation_suffix)]
+            self._rotate_collector_certificate(server_id)
+            return
+        retirement_suffix = "/retirement"
+        if self.path.startswith(prefix) and self.path.endswith(
+            retirement_suffix
+        ):
+            server_id = self.path[len(prefix) : -len(retirement_suffix)]
+            self._retire_server(server_id)
+            return
+        address_change_suffix = "/scrape-address-changes"
+        if self.path.startswith(prefix) and self.path.endswith(
+            address_change_suffix
+        ):
+            server_id = self.path[len(prefix) : -len(address_change_suffix)]
+            self._stage_scrape_address_change(server_id)
+            return
+        address_activation_suffix = "/scrape-address-activations"
+        if self.path.startswith(prefix) and self.path.endswith(
+            address_activation_suffix
+        ):
+            server_id = self.path[
+                len(prefix) : -len(address_activation_suffix)
+            ]
+            self._activate_scrape_address_change(server_id)
+            return
         telemetry_suffix = "/staged-telemetry-checks"
         if self.path.startswith(prefix) and self.path.endswith(
             telemetry_suffix
@@ -416,6 +481,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"})
             return
 
+        expire_collector_certificates(self.server.config.database_path)
         experience = empty_fleet_experience(viewer.role)
         servers = list_registered_servers(self.server.config.database_path)
         fleet = [
@@ -423,7 +489,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             for server in servers
             if (
                 viewer.role is Role.LAB_ADMINISTRATOR
-                or server.enrollment_state == "active"
+                or server.enrollment_state
+                in ("active", "re-enrollment-required")
             )
         ]
         self._send_json(
@@ -942,6 +1009,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_token_request"}
             )
             return
+        if not server_accepts_bootstrap(
+            self.server.config.database_path, server_id=server_id
+        ):
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "server_not_awaiting_first_contact"},
+            )
+            return
         installer = signed_installer(
             self.server.config.database_path.parent
         )
@@ -973,6 +1048,218 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "signingKeySha256": installer.signing_key_sha256,
                     "requiresNvidia": requires_nvidia,
                 },
+            },
+        )
+
+    def _revoke_collector_certificate(self, server_id: str) -> None:
+        self._change_collector_lifecycle(
+            server_id, revoke_collector_certificate
+        )
+
+    def _rotate_collector_certificate(self, server_id: str) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"certificateSigningRequest", "reason"}
+            or not all(isinstance(value, str) for value in document.values())
+            or not 1 <= len(document["reason"].strip()) <= 500
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_rotation_request"}
+            )
+            return
+        try:
+            issued = issue_collector_certificate(
+                self.server.config.database_path.parent,
+                server_id=server_id,
+                csr=document["certificateSigningRequest"],
+                scrape_address=server_scrape_address(
+                    self.server.config.database_path, server_id=server_id
+                ),
+            )
+            overlap_ends_at = rotate_collector_certificate(
+                self.server.config.database_path,
+                server_id=server_id,
+                new_fingerprint=issued.collector_public_key_fingerprint,
+                expires_at=issued.expires_at,
+                actor=viewer.login,
+                reason=document["reason"].strip(),
+            )
+        except InvalidCertificateSigningRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_certificate_signing_request"},
+            )
+            return
+        except CollectorLifecycleConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "collector_lifecycle_conflict"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.CREATED,
+            {
+                "certificate": issued.certificate,
+                "caCertificate": issued.ca_certificate,
+                "expiresAt": issued.expires_at.isoformat(),
+                "previousCredentialAcceptedUntil": (
+                    overlap_ends_at.isoformat()
+                ),
+            },
+        )
+
+    def _retire_server(self, server_id: str) -> None:
+        self._change_collector_lifecycle(server_id, retire_server)
+
+    def _change_collector_lifecycle(
+        self,
+        server_id: str,
+        operation: Callable[..., RegisteredServer],
+    ) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"reason"}
+            or not isinstance(document["reason"], str)
+            or not 1 <= len(document["reason"].strip()) <= 500
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_lifecycle_request"}
+            )
+            return
+        try:
+            server = operation(
+                self.server.config.database_path,
+                server_id=server_id,
+                actor=viewer.login,
+                reason=document["reason"].strip(),
+            )
+        except CollectorLifecycleConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "collector_lifecycle_conflict"}
+            )
+            return
+        response = self._administrator_server_response(server)
+        if server.enrollment_state == "retired":
+            response.pop("serverHealth", None)
+        self._send_json(HTTPStatus.OK, {"server": response})
+
+    def _stage_scrape_address_change(self, server_id: str) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document)
+            != {"scrapeAddress", "collectorFingerprint", "reason"}
+            or not all(
+                isinstance(document[field], str)
+                for field in ("collectorFingerprint", "reason")
+            )
+            or not 1 <= len(document["reason"].strip()) <= 500
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_address_change"}
+            )
+            return
+        try:
+            scrape_address = parse_scrape_address(document["scrapeAddress"])
+            stage_scrape_address_change(
+                self.server.config.database_path,
+                server_id=server_id,
+                scrape_address=scrape_address,
+                expected_fingerprint=document["collectorFingerprint"],
+                actor=viewer.login,
+                reason=document["reason"].strip(),
+            )
+        except InvalidRegistration:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_scrape_address"}
+            )
+            return
+        except CollectorLifecycleConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "collector_fingerprint_mismatch"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.ACCEPTED,
+            {
+                "scrapeAddress": scrape_address,
+                "observationTargetSet": "staging",
+            },
+        )
+
+    def _activate_scrape_address_change(self, server_id: str) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"observedCollectorFingerprint"}
+            or not isinstance(
+                document["observedCollectorFingerprint"], str
+            )
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_address_activation"}
+            )
+            return
+        try:
+            server = activate_scrape_address_change(
+                self.server.config.database_path,
+                server_id=server_id,
+                observed_fingerprint=document[
+                    "observedCollectorFingerprint"
+                ],
+                actor=viewer.login,
+            )
+        except CollectorLifecycleConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "collector_fingerprint_mismatch"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {"server": self._administrator_server_response(server)},
+        )
+
+    def _recover_intermediate_ca(self) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"reason"}
+            or not isinstance(document["reason"], str)
+            or not 1 <= len(document["reason"].strip()) <= 500
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_recovery_request"}
+            )
+            return
+        affected = recover_compromised_intermediate(
+            self.server.config.database_path,
+            actor=viewer.login,
+            reason=document["reason"].strip(),
+        )
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "trustState": "failed-closed",
+                "affectedServers": affected,
+                "nextAction": "replace-intermediate-from-offline-root",
             },
         )
 
@@ -1052,6 +1339,76 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "validForDays": CERTIFICATE_VALIDITY_DAYS,
                 "scrapeSet": "staging",
                 "verificationCode": issued.verification_code,
+            },
+        )
+
+    def _renew_collector_certificate(self, server_id: str) -> None:
+        document = self._read_json()
+        current_fingerprint = self.headers.get(
+            "X-Collector-Certificate-Fingerprint", ""
+        )
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"certificateSigningRequest"}
+            or not isinstance(document["certificateSigningRequest"], str)
+            or not current_fingerprint
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_renewal_request"}
+            )
+            return
+        try:
+            if not collector_renewal_is_due(
+                self.server.config.database_path,
+                server_id=server_id,
+                current_fingerprint=current_fingerprint,
+            ):
+                raise CollectorRenewalNotDue
+        except CollectorLifecycleConflict:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "invalid_collector_identity"},
+            )
+            return
+        except CollectorRenewalNotDue:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "certificate_renewal_not_due",
+                    "retryBackoffSeconds": [60, 300, 1800, 7200],
+                },
+            )
+            return
+        try:
+            issued = issue_collector_certificate(
+                self.server.config.database_path.parent,
+                server_id=server_id,
+                csr=document["certificateSigningRequest"],
+                scrape_address=server_scrape_address(
+                    self.server.config.database_path, server_id=server_id
+                ),
+            )
+            renew_collector_certificate(
+                self.server.config.database_path,
+                server_id=server_id,
+                current_fingerprint=current_fingerprint,
+                new_fingerprint=issued.collector_public_key_fingerprint,
+                expires_at=issued.expires_at,
+            )
+        except InvalidCertificateSigningRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_certificate_signing_request"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.CREATED,
+            {
+                "certificate": issued.certificate,
+                "caCertificate": issued.ca_certificate,
+                "expiresAt": issued.expires_at.isoformat(),
+                "renewAtDaysRemaining": 10,
+                "retryBackoffSeconds": [60, 300, 1800, 7200],
             },
         )
 
@@ -1292,6 +1649,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             response["activeConfigurationHash"] = (
                 server.active_configuration_hash
             )
+        expiry_warning = certificate_expiry_warning_days(server)
+        if expiry_warning is not None:
+            response["certificateExpiryWarningDays"] = expiry_warning
         return response
 
     def _fleet_server_response(
@@ -1311,7 +1671,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "enrollmentState": server.enrollment_state,
                 "serverHealth": None,
             }
-        if server.enrollment_state == "active":
+        if server.enrollment_state in ("active", "re-enrollment-required"):
             evaluation = self._health_evaluation(server)
             response["serverHealth"] = evaluation["serverHealth"]
             if role is Role.LAB_ADMINISTRATOR:
@@ -1374,18 +1734,21 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self, server: RegisteredServer
     ) -> HealthEvaluation:
         mountpoints = self._persistent_mountpoints(server)
-        try:
-            observation = current_health_observation(
-                self.server.config.prometheus_url,
-                server.server_id,
-                mountpoints,
-                required_observations=profile_required_observations(server),
-                required_services=profile_required_services(server),
-                temperature_sensors=profile_temperature_sensors(server),
-                expected_gpu_count=profile_expected_gpu_count(server),
-            )
-        except PrometheusUnavailable:
+        if server.enrollment_state == "re-enrollment-required":
             observation = unavailable_health_observation(mountpoints)
+        else:
+            try:
+                observation = current_health_observation(
+                    self.server.config.prometheus_url,
+                    server.server_id,
+                    mountpoints,
+                    required_observations=profile_required_observations(server),
+                    required_services=profile_required_services(server),
+                    temperature_sensors=profile_temperature_sensors(server),
+                    expected_gpu_count=profile_expected_gpu_count(server),
+                )
+            except PrometheusUnavailable:
+                observation = unavailable_health_observation(mountpoints)
         observation["inventoryMatchesProfile"] = (
             server.pending_inventory_change is None
         )
@@ -1434,7 +1797,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         )
         if server is None or (
             viewer.role is Role.LAB_USER
-            and server.enrollment_state != "active"
+            and server.enrollment_state
+            not in ("active", "re-enrollment-required")
         ):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
