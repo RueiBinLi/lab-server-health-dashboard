@@ -6,7 +6,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 
 GIBIBYTE = 1024**3
@@ -19,6 +19,17 @@ class FilesystemHealthObservation(TypedDict):
     exhaustionWithin24Hours: bool | None
 
 
+class RequiredServiceHealthObservation(TypedDict):
+    service: str
+    active: bool | None
+
+
+class TemperatureHealthObservation(TypedDict):
+    logicalName: str
+    headroomCelsius: float | None
+    throttling: bool | None
+
+
 class HealthObservation(TypedDict):
     primaryTelemetrySuccessful: bool | None
     requiredObservationsComplete: bool | None
@@ -26,6 +37,9 @@ class HealthObservation(TypedDict):
     normalizedLoad5: float | None
     memoryAvailablePercent: float | None
     filesystems: list[FilesystemHealthObservation]
+    requiredServices: NotRequired[list[RequiredServiceHealthObservation]]
+    temperatures: NotRequired[list[TemperatureHealthObservation]]
+    inventoryMatchesProfile: NotRequired[bool | None]
 
 
 class HealthCause(TypedDict):
@@ -46,6 +60,8 @@ class ServerIncident(TypedDict):
     closedAt: str | None
     currentSeverity: str
     transitions: list[IncidentTransition]
+    profileId: NotRequired[str]
+    profileRevision: NotRequired[int]
 
 
 class ServerHealth(TypedDict):
@@ -76,6 +92,7 @@ class _RuleCondition:
 _RULE_ORDER = (
     "primary-telemetry",
     "required-observations",
+    "inventory-change",
     "cpu-pressure",
     "memory-pressure",
 )
@@ -83,6 +100,7 @@ _RULE_ORDER = (
 _SUMMARIES = {
     "primary-telemetry": "Primary telemetry is unavailable.",
     "required-observations": "Required observations are incomplete.",
+    "inventory-change": "Required Server Inventory changed unexpectedly.",
     "cpu-pressure": "CPU utilization and normalized load are both sustained.",
     "memory-pressure": "Available system memory is low.",
 }
@@ -112,10 +130,29 @@ def initialize_health_database(path: Path) -> None:
                     server_id TEXT NOT NULL REFERENCES servers(server_id),
                     opened_at TEXT NOT NULL,
                     closed_at TEXT,
-                    current_severity TEXT NOT NULL
+                    current_severity TEXT NOT NULL,
+                    profile_id TEXT,
+                    profile_revision INTEGER
                 )
                 """
             )
+            existing_incident_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(server_incidents)"
+                )
+            }
+            if "profile_id" not in existing_incident_columns:
+                connection.execute(
+                    "ALTER TABLE server_incidents ADD COLUMN profile_id TEXT"
+                )
+            if "profile_revision" not in existing_incident_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE server_incidents
+                    ADD COLUMN profile_revision INTEGER
+                    """
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS one_open_server_incident
@@ -143,6 +180,7 @@ def evaluate_server_health(
     server_id: str,
     observation: HealthObservation,
     now: datetime,
+    threshold_overrides: tuple[dict[str, object], ...] = (),
 ) -> HealthEvaluation:
     if now.tzinfo is None:
         raise ValueError("health evaluation time must be timezone-aware")
@@ -162,7 +200,7 @@ def evaluate_server_health(
             if stored is not None
             else {}
         )
-        conditions = _rule_conditions(observation)
+        conditions = _rule_conditions(observation, threshold_overrides)
         states = {
             rule: state for rule, state in states.items() if rule in conditions
         }
@@ -234,12 +272,73 @@ def evaluate_server_health(
 
 def _rule_conditions(
     observation: HealthObservation,
+    threshold_overrides: tuple[dict[str, object], ...],
 ) -> dict[str, _RuleCondition]:
     primary = observation.get("primaryTelemetrySuccessful")
     complete = observation.get("requiredObservationsComplete")
     cpu = _number(observation.get("cpuUsedPercent"))
     load = _number(observation.get("normalizedLoad5"))
     memory = _number(observation.get("memoryAvailablePercent"))
+    cpu_fire = _override_value(
+        threshold_overrides, "cpu-used-percent", "fireAbove", 95
+    )
+    cpu_clear = _override_value(
+        threshold_overrides, "cpu-used-percent", "clearBelow", 85
+    )
+    load_fire = _override_value(
+        threshold_overrides, "normalized-load", "fireAbove", 1.5
+    )
+    load_clear = _override_value(
+        threshold_overrides, "normalized-load", "clearBelow", 1.1
+    )
+    memory_fire = _override_value(
+        threshold_overrides,
+        "memory-available-percent",
+        "fireBelow",
+        10,
+    )
+    memory_clear = _override_value(
+        threshold_overrides,
+        "memory-available-percent",
+        "clearAbove",
+        15,
+    )
+    filesystem_percent_fire = _override_value(
+        threshold_overrides,
+        "filesystem-free-percent",
+        "fireBelow",
+        10,
+    )
+    filesystem_percent_clear = _override_value(
+        threshold_overrides,
+        "filesystem-free-percent",
+        "clearAbove",
+        15,
+    )
+    filesystem_bytes_fire = _override_value(
+        threshold_overrides,
+        "filesystem-free-bytes",
+        "fireBelow",
+        20 * GIBIBYTE,
+    )
+    filesystem_bytes_clear = _override_value(
+        threshold_overrides,
+        "filesystem-free-bytes",
+        "clearAbove",
+        30 * GIBIBYTE,
+    )
+    temperature_fire = _override_value(
+        threshold_overrides,
+        "temperature-headroom",
+        "fireBelow",
+        10,
+    )
+    temperature_clear = _override_value(
+        threshold_overrides,
+        "temperature-headroom",
+        "clearAbove",
+        15,
+    )
     conditions: dict[str, _RuleCondition] = {
         "primary-telemetry": _RuleCondition(
             firing=None if primary is None else not primary,
@@ -257,19 +356,19 @@ def _rule_conditions(
             firing=(
                 None
                 if cpu is None or load is None
-                else cpu >= 95 and load > 1.5
+                else cpu >= cpu_fire and load > load_fire
             ),
             clearing=(
                 None
                 if cpu is None or load is None
-                else cpu < 85 or load < 1.1
+                else cpu < cpu_clear or load < load_clear
             ),
             firing_seconds=10 * 60,
             clearing_seconds=5 * 60,
         ),
         "memory-pressure": _RuleCondition(
-            firing=None if memory is None else memory < 10,
-            clearing=None if memory is None else memory > 15,
+            firing=None if memory is None else memory < memory_fire,
+            clearing=None if memory is None else memory > memory_clear,
             firing_seconds=5 * 60,
             clearing_seconds=5 * 60,
         ),
@@ -286,13 +385,15 @@ def _rule_conditions(
         enough_headroom = (
             None
             if free_percent is None or free_bytes is None
-            else free_percent > 15 or free_bytes > 30 * GIBIBYTE
+            else free_percent > filesystem_percent_clear
+            or free_bytes > filesystem_bytes_clear
         )
         conditions[capacity_rule] = _RuleCondition(
             firing=(
                 None
                 if free_percent is None or free_bytes is None
-                else free_percent < 10 and free_bytes < 20 * GIBIBYTE
+                else free_percent < filesystem_percent_fire
+                and free_bytes < filesystem_bytes_fire
             ),
             clearing=enough_headroom,
             firing_seconds=10 * 60,
@@ -308,7 +409,63 @@ def _rule_conditions(
             firing_seconds=0,
             clearing_seconds=10 * 60,
         )
+    inventory_matches = observation.get("inventoryMatchesProfile")
+    if inventory_matches is not None:
+        conditions["inventory-change"] = _RuleCondition(
+            firing=not inventory_matches,
+            clearing=inventory_matches,
+            firing_seconds=0,
+            clearing_seconds=0,
+        )
+    for service in observation.get("requiredServices", []):
+        name = service.get("service")
+        active = service.get("active")
+        if not isinstance(name, str):
+            continue
+        conditions[f"required-service:{name}"] = _RuleCondition(
+            firing=active is not True,
+            clearing=active is True,
+            firing_seconds=2 * 60,
+            clearing_seconds=2 * 60,
+        )
+    for temperature in observation.get("temperatures", []):
+        logical_name = temperature.get("logicalName")
+        headroom = _number(temperature.get("headroomCelsius"))
+        throttling = temperature.get("throttling")
+        if not isinstance(logical_name, str):
+            continue
+        conditions[
+            f"temperature-headroom:{logical_name}"
+        ] = _RuleCondition(
+            firing=(
+                None
+                if headroom is None or not isinstance(throttling, bool)
+                else headroom <= temperature_fire or throttling
+            ),
+            clearing=(
+                None
+                if headroom is None or not isinstance(throttling, bool)
+                else headroom > temperature_clear and not throttling
+            ),
+            firing_seconds=5 * 60,
+            clearing_seconds=10 * 60,
+        )
     return conditions
+
+
+def _override_value(
+    overrides: tuple[dict[str, object], ...],
+    key: str,
+    field: str,
+    default: float,
+) -> float:
+    for override in overrides:
+        if override.get("key") != key:
+            continue
+        value = override.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return default
 
 
 def _advance_rule(
@@ -404,13 +561,32 @@ def _record_incident_transition(
         )
         return
     if open_incident is None:
+        profile = connection.execute(
+            """
+            SELECT profile_id, profile_revision
+            FROM servers
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
         cursor = connection.execute(
             """
             INSERT INTO server_incidents (
-                server_id, opened_at, current_severity
-            ) VALUES (?, ?, ?)
+                server_id, opened_at, current_severity,
+                profile_id, profile_revision
+            ) VALUES (?, ?, ?, ?, ?)
             """,
-            (server_id, occurred_at.isoformat(), health),
+            (
+                server_id,
+                occurred_at.isoformat(),
+                health,
+                profile["profile_id"] if profile is not None else None,
+                (
+                    profile["profile_revision"]
+                    if profile is not None
+                    else None
+                ),
+            ),
         )
         incident_id = cast(int, cursor.lastrowid)
         connection.execute(
@@ -466,7 +642,9 @@ def _list_incidents(
 ) -> list[ServerIncident]:
     rows = connection.execute(
         """
-        SELECT incident_id, opened_at, closed_at, current_severity
+        SELECT
+            incident_id, opened_at, closed_at, current_severity,
+            profile_id, profile_revision
         FROM server_incidents
         WHERE server_id = ?
         ORDER BY incident_id DESC
@@ -484,8 +662,7 @@ def _list_incidents(
             """,
             (row["incident_id"],),
         ).fetchall()
-        incidents.append(
-            {
+        incident: ServerIncident = {
                 "incidentId": row["incident_id"],
                 "openedAt": row["opened_at"],
                 "closedAt": row["closed_at"],
@@ -502,7 +679,10 @@ def _list_incidents(
                     for transition in transition_rows
                 ],
             }
-        )
+        if row["profile_id"] is not None:
+            incident["profileId"] = row["profile_id"]
+            incident["profileRevision"] = row["profile_revision"]
+        incidents.append(incident)
     return incidents
 
 
@@ -519,6 +699,13 @@ def _summary(rule: str) -> str:
         return (
             f"Persistent filesystem {rule.split(':', 1)[1]} "
             "may exhaust within 24 hours."
+        )
+    if rule.startswith("required-service:"):
+        return f"Required Service {rule.split(':', 1)[1]} is not active."
+    if rule.startswith("temperature-headroom:"):
+        return (
+            f"Temperature sensor {rule.split(':', 1)[1]} "
+            "has insufficient hardware-relative headroom."
         )
     return _SUMMARIES[rule]
 

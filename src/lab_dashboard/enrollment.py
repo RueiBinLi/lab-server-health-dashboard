@@ -56,6 +56,13 @@ class StableIdentifiers:
 
 
 @dataclass(frozen=True)
+class TemperatureSensorBinding:
+    logical_name: str
+    sensor_id: str
+    limit_source: str
+
+
+@dataclass(frozen=True)
 class ServerInventory:
     hostname: str
     os_release: str
@@ -65,9 +72,10 @@ class ServerInventory:
     disks: tuple[DiskInventory, ...]
     gpus: tuple[GpuInventory, ...]
     stable_identifiers: StableIdentifiers
+    temperature_sensor_bindings: tuple[TemperatureSensorBinding, ...] = ()
 
     def as_document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "hostname": self.hostname,
             "osRelease": self.os_release,
             "architecture": self.architecture,
@@ -98,6 +106,16 @@ class ServerInventory:
                 "systemUuid": self.stable_identifiers.system_uuid,
             },
         }
+        if self.temperature_sensor_bindings:
+            document["temperatureSensorBindings"] = [
+                {
+                    "logicalName": binding.logical_name,
+                    "sensorId": binding.sensor_id,
+                    "limitSource": binding.limit_source,
+                }
+                for binding in self.temperature_sensor_bindings
+            ]
+        return document
 
 
 @dataclass(frozen=True)
@@ -194,9 +212,12 @@ def parse_first_contact(document: object) -> FirstContact:
         "gpus",
         "stableIdentifiers",
     }
+    optional_fields = {"temperatureSensorBindings"}
     if (
         not isinstance(document, dict)
-        or set(document) != scalar_fields | structured_fields
+        or not (scalar_fields | structured_fields) <= set(document)
+        or not set(document)
+        <= scalar_fields | structured_fields | optional_fields
         or not all(
             isinstance(document[field], str)
             and 1 <= len(document[field].strip()) <= 16_384
@@ -214,6 +235,10 @@ def parse_first_contact(document: object) -> FirstContact:
         "gpus": document["gpus"],
         "stableIdentifiers": document["stableIdentifiers"],
     }
+    if "temperatureSensorBindings" in document:
+        inventory_document["temperatureSensorBindings"] = document[
+            "temperatureSensorBindings"
+        ]
     return FirstContact(
         server_id=document["serverId"].strip(),
         bootstrap_token=document["bootstrapToken"],
@@ -227,8 +252,7 @@ def parse_first_contact(document: object) -> FirstContact:
 def server_inventory_from_document(document: object) -> ServerInventory:
     if (
         not isinstance(document, dict)
-        or set(document)
-        != {
+        or not {
             "hostname",
             "osRelease",
             "architecture",
@@ -237,6 +261,19 @@ def server_inventory_from_document(document: object) -> ServerInventory:
             "disks",
             "gpus",
             "stableIdentifiers",
+        }
+        <= set(document)
+        or not set(document)
+        <= {
+            "hostname",
+            "osRelease",
+            "architecture",
+            "cpu",
+            "memory",
+            "disks",
+            "gpus",
+            "stableIdentifiers",
+            "temperatureSensorBindings",
         }
         or not all(
             _nonempty_string(document[field])
@@ -247,6 +284,9 @@ def server_inventory_from_document(document: object) -> ServerInventory:
         or not _valid_devices(document["disks"], disk=True)
         or not _valid_devices(document["gpus"], disk=False)
         or not _valid_stable_identifiers(document["stableIdentifiers"])
+        or not _valid_temperature_sensor_bindings(
+            document.get("temperatureSensorBindings", [])
+        )
     ):
         raise InvalidFirstContact
     cpu = cast(dict[str, object], document["cpu"])
@@ -254,6 +294,10 @@ def server_inventory_from_document(document: object) -> ServerInventory:
     disks = cast(list[dict[str, object]], document["disks"])
     gpus = cast(list[dict[str, object]], document["gpus"])
     stable = cast(dict[str, object], document["stableIdentifiers"])
+    sensor_bindings = cast(
+        list[dict[str, object]],
+        document.get("temperatureSensorBindings", []),
+    )
     return ServerInventory(
         hostname=cast(str, document["hostname"]),
         os_release=cast(str, document["osRelease"]),
@@ -286,7 +330,34 @@ def server_inventory_from_document(document: object) -> ServerInventory:
             machine_id=cast(str, stable["machineId"]),
             system_uuid=cast(str, stable["systemUuid"]),
         ),
+        temperature_sensor_bindings=tuple(
+            TemperatureSensorBinding(
+                logical_name=cast(str, binding["logicalName"]),
+                sensor_id=cast(str, binding["sensorId"]),
+                limit_source=cast(str, binding["limitSource"]),
+            )
+            for binding in sensor_bindings
+        ),
     )
+
+
+def _valid_temperature_sensor_bindings(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    logical_names: set[str] = set()
+    for binding in value:
+        if (
+            not isinstance(binding, dict)
+            or set(binding) != {"logicalName", "sensorId", "limitSource"}
+            or not _nonempty_string(binding["logicalName"])
+            or not _nonempty_string(binding["sensorId"])
+            or binding["logicalName"] in logical_names
+            or binding["limitSource"]
+            not in {"hardware-critical", "hardware-slowdown"}
+        ):
+            return False
+        logical_names.add(cast(str, binding["logicalName"]))
+    return True
 
 
 def parse_enrollment_decision(document: object) -> EnrollmentDecision:

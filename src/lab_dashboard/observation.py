@@ -14,6 +14,8 @@ from lab_dashboard.database import (
     profile_persistent_mountpoints,
     profile_required_observations,
     profile_required_services,
+    profile_temperature_sensors,
+    profile_threshold_overrides,
     record_observation_run,
 )
 from lab_dashboard.health import evaluate_server_health, health_now
@@ -124,6 +126,7 @@ class ObservationEngine:
                         server
                     ),
                     required_services=profile_required_services(server),
+                    temperature_sensors=profile_temperature_sensors(server),
                 )
             except PrometheusUnavailable:
                 observation = unavailable_health_observation(mountpoints)
@@ -132,6 +135,7 @@ class ObservationEngine:
                 server_id=server.server_id,
                 observation=observation,
                 now=health_now(),
+                threshold_overrides=profile_threshold_overrides(server),
             )
 
 

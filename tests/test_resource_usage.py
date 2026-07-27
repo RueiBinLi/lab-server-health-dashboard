@@ -182,6 +182,16 @@ class ResourceUsageHttpTests(unittest.TestCase):
         self.assertEqual(unrestricted, (400, {"error": "invalid_history_query"}))
         query.assert_called_once()
         self.assertIsNone(response[1]["points"][1]["value"])
+        self.assertEqual(
+            {
+                (
+                    point["profileId"],
+                    point["profileRevision"],
+                )
+                for point in response[1]["points"]
+            },
+            {("general-linux", 1)},
+        )
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ from lab_dashboard.database import (
 from lab_dashboard.health import (
     FilesystemHealthObservation,
     HealthObservation,
+    RequiredServiceHealthObservation,
+    TemperatureHealthObservation,
 )
 
 
@@ -73,6 +75,7 @@ def current_health_observation(
     *,
     required_observations: tuple[str, ...] = (),
     required_services: tuple[str, ...] = (),
+    temperature_sensors: tuple[str, ...] = (),
 ) -> HealthObservation:
     primary_sample = _instant_sample(
         prometheus_url, f'up{{server_id="{server_id}"}}'
@@ -140,6 +143,45 @@ def current_health_observation(
                 ),
             }
         )
+    service_observations: list[RequiredServiceHealthObservation] = []
+    for service in required_services:
+        active = _instant_value(
+            prometheus_url,
+            (
+                "max(node_systemd_unit_state"
+                f'{{server_id="{server_id}",name="{_label(service)}",'
+                'state="active"})'
+            ),
+        )
+        service_observations.append(
+            {
+                "service": service,
+                "active": None if active is None else active == 1,
+            }
+        )
+    temperature_observations: list[TemperatureHealthObservation] = []
+    for logical_name in temperature_sensors:
+        selector = (
+            f'server_id="{server_id}",'
+            f'logical_sensor="{_label(logical_name)}"'
+        )
+        headroom = _instant_value(
+            prometheus_url,
+            f"lab_temperature_headroom_celsius{{{selector}}}",
+        )
+        throttling = _instant_value(
+            prometheus_url,
+            f"lab_temperature_throttling{{{selector}}}",
+        )
+        temperature_observations.append(
+            {
+                "logicalName": logical_name,
+                "headroomCelsius": headroom,
+                "throttling": (
+                    None if throttling is None else throttling > 0
+                ),
+            }
+        )
     required_complete = (
         primary_successful
         and cpu is not None
@@ -164,14 +206,13 @@ def current_health_observation(
             for required in required_observations
         )
         and all(
-            _series_present(
-                prometheus_url,
-                (
-                    "node_systemd_unit_state"
-                    f'{{server_id="{server_id}",name="{_label(service)}"}}'
-                ),
-            )
-            for service in required_services
+            service["active"] is not None
+            for service in service_observations
+        )
+        and all(
+            temperature["headroomCelsius"] is not None
+            and temperature["throttling"] is not None
+            for temperature in temperature_observations
         )
     )
     return {
@@ -181,6 +222,8 @@ def current_health_observation(
         "normalizedLoad5": _rounded(normalized_load),
         "memoryAvailablePercent": _rounded(memory_available_percent),
         "filesystems": filesystems,
+        "requiredServices": service_observations,
+        "temperatures": temperature_observations,
     }
 
 

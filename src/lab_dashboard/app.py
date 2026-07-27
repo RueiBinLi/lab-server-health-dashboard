@@ -13,32 +13,53 @@ from lab_dashboard.auth import Role, Viewer, authorize
 from lab_dashboard.config import DashboardConfig
 from lab_dashboard.database import (
     BOOTSTRAP_TOKEN_TTL_SECONDS,
+    ConfigurationHashMismatch,
     DisplayNameConflict,
     EnrollmentDecisionConflict,
     IncompleteObservations,
     InvalidBootstrapCredentials,
+    ProfileConflict,
+    ProfileNotFound,
     ProfileNotPublished,
+    ProfileInventoryMismatch,
+    ProfilePublication,
     RegisteredServer,
+    ServerProfile,
+    StagedProfileConfiguration,
+    StagedProfileVerificationFailed,
     ServerNotAwaitingFirstContact,
     VerificationCodeMismatch,
+    activate_staged_profile_configuration,
+    accept_inventory_change,
+    clone_profile,
     consume_bootstrap_token,
+    create_profile_draft,
     decide_enrollment,
     get_staging_observation_target,
     initialize_database,
     issue_bootstrap_token,
     is_ready,
     list_audit_events,
+    list_profiles,
     list_published_profiles,
     list_registered_servers,
     profile_persistent_mountpoints,
     profile_required_observations,
     profile_required_services,
+    profile_revision_at,
+    profile_temperature_sensors,
+    profile_threshold_overrides,
+    publish_profile,
     record_bootstrap_failure,
     record_failed_registration,
+    record_inventory_observation,
     record_staged_observations,
     register_server,
+    retire_profile,
     server_requires_nvidia,
     server_scrape_address,
+    stage_profile_configuration,
+    staged_profile_configuration,
     validate_bootstrap_token,
 )
 from lab_dashboard.enrollment import (
@@ -50,6 +71,7 @@ from lab_dashboard.enrollment import (
     parse_first_contact,
     parse_registration,
     safe_audit_reason,
+    server_inventory_from_document,
 )
 from lab_dashboard.installer import signed_installer
 from lab_dashboard.health import (
@@ -69,6 +91,15 @@ from lab_dashboard.pki import (
     issue_collector_certificate,
 )
 from lab_dashboard.presentation import empty_fleet_experience
+from lab_dashboard.profile import (
+    InvalidProfileDefinition,
+    InvalidProfileRequest,
+    parse_profile_clone,
+    parse_profile_draft,
+    parse_profile_activation,
+    parse_profile_target,
+    parse_reason,
+)
 from lab_dashboard.prometheus import (
     HISTORY_METRICS,
     InvalidHistoryQuery,
@@ -178,10 +209,24 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_fleet()
             return
         if path == "/api/server-profiles":
-            self._send_server_profiles()
+            self._send_server_profiles(
+                include_all=(
+                    parse_qs(request.query).get("include") == ["all"]
+                )
+            )
             return
         if path == "/api/audit-events":
             self._send_audit_events()
+            return
+        collector_prefix = "/api/collectors/"
+        configuration_suffix = "/profile-configuration"
+        if path.startswith(collector_prefix) and path.endswith(
+            configuration_suffix
+        ):
+            server_id = path[
+                len(collector_prefix) : -len(configuration_suffix)
+            ]
+            self._send_collector_profile_configuration(server_id)
             return
         server_prefix = "/api/servers/"
         history_suffix = "/metric-history"
@@ -208,6 +253,45 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:
+        request = urlsplit(self.path)
+        path = request.path
+        if path == "/api/server-profiles":
+            self._clone_server_profile()
+            return
+        profile_prefix = "/api/server-profiles/"
+        if path.startswith(profile_prefix):
+            profile_parts = path[len(profile_prefix) :].split("/")
+            if len(profile_parts) == 2 and profile_parts[1] == "revisions":
+                self._create_server_profile_draft(profile_parts[0])
+                return
+            if (
+                len(profile_parts) == 4
+                and profile_parts[1] == "revisions"
+                and profile_parts[3] == "publish"
+            ):
+                try:
+                    revision = int(profile_parts[2])
+                except ValueError:
+                    pass
+                else:
+                    self._publish_server_profile(
+                        profile_parts[0], revision
+                    )
+                    return
+            if (
+                len(profile_parts) == 4
+                and profile_parts[1] == "revisions"
+                and profile_parts[3] == "retire"
+            ):
+                try:
+                    revision = int(profile_parts[2])
+                except ValueError:
+                    pass
+                else:
+                    self._retire_server_profile(
+                        profile_parts[0], revision
+                    )
+                    return
         if self.path == "/api/servers":
             self._register_server()
             return
@@ -218,6 +302,45 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_enrollment_requirements()
             return
         prefix = "/api/servers/"
+        activation_suffix = "/profile-activations"
+        if self.path.startswith(prefix) and self.path.endswith(
+            activation_suffix
+        ):
+            server_id = self.path[len(prefix) : -len(activation_suffix)]
+            self._activate_server_profile(server_id)
+            return
+        assignment_suffix = "/profile-assignments"
+        if self.path.startswith(prefix) and self.path.endswith(
+            assignment_suffix
+        ):
+            server_id = self.path[len(prefix) : -len(assignment_suffix)]
+            self._stage_server_profile(server_id, operation="assignment")
+            return
+        rollback_suffix = "/profile-rollbacks"
+        if self.path.startswith(prefix) and self.path.endswith(
+            rollback_suffix
+        ):
+            server_id = self.path[len(prefix) : -len(rollback_suffix)]
+            self._stage_server_profile(server_id, operation="rollback")
+            return
+        inventory_observation_suffix = "/inventory-observations"
+        if self.path.startswith(prefix) and self.path.endswith(
+            inventory_observation_suffix
+        ):
+            server_id = self.path[
+                len(prefix) : -len(inventory_observation_suffix)
+            ]
+            self._record_inventory_observation(server_id)
+            return
+        inventory_acceptance_suffix = "/inventory-acceptances"
+        if self.path.startswith(prefix) and self.path.endswith(
+            inventory_acceptance_suffix
+        ):
+            server_id = self.path[
+                len(prefix) : -len(inventory_acceptance_suffix)
+            ]
+            self._accept_inventory_change(server_id)
+            return
         telemetry_suffix = "/staged-telemetry-checks"
         if self.path.startswith(prefix) and self.path.endswith(
             telemetry_suffix
@@ -270,11 +393,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _send_server_profiles(self) -> None:
+    def _send_server_profiles(self, *, include_all: bool = False) -> None:
         viewer = self._lab_administrator()
         if viewer is None:
             return
-        profiles = list_published_profiles(self.server.config.database_path)
+        profiles = list_profiles(
+            self.server.config.database_path, include_all=include_all
+        )
         self._send_json(
             HTTPStatus.OK,
             {
@@ -291,6 +416,174 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _clone_server_profile(self) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        try:
+            request = parse_profile_clone(self._read_json())
+            profile = clone_profile(
+                self.server.config.database_path,
+                request=request,
+                actor=viewer.login,
+            )
+        except InvalidProfileRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_profile_request"}
+            )
+            return
+        except ProfileNotFound:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, {"error": "profile_not_found"}
+            )
+            return
+        except ProfileConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "profile_conflict"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.CREATED, {"profile": self._profile_response(profile)}
+        )
+
+    def _create_server_profile_draft(self, profile_id: str) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        try:
+            request = parse_profile_draft(self._read_json())
+            profile = create_profile_draft(
+                self.server.config.database_path,
+                profile_id=profile_id,
+                request=request,
+                actor=viewer.login,
+            )
+        except InvalidProfileDefinition as error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "invalid_profile_definition",
+                    "details": error.details,
+                },
+            )
+            return
+        except InvalidProfileRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_profile_request"}
+            )
+            return
+        except ProfileNotFound:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, {"error": "profile_not_found"}
+            )
+            return
+        except ProfileConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "profile_conflict"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.CREATED, {"profile": self._profile_response(profile)}
+        )
+
+    def _publish_server_profile(
+        self, profile_id: str, revision: int
+    ) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        try:
+            reason = parse_reason(self._read_json())
+            publication = publish_profile(
+                self.server.config.database_path,
+                profile_id=profile_id,
+                revision=revision,
+                actor=viewer.login,
+                reason=reason,
+            )
+        except InvalidProfileRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_profile_request"}
+            )
+            return
+        except InvalidProfileDefinition as error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "invalid_profile_definition",
+                    "details": error.details,
+                },
+            )
+            return
+        except ProfileNotFound:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, {"error": "profile_not_found"}
+            )
+            return
+        except ProfileConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "profile_conflict"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK, self._publication_response(publication)
+        )
+
+    def _retire_server_profile(
+        self, profile_id: str, revision: int
+    ) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        try:
+            reason = parse_reason(self._read_json())
+            profile = retire_profile(
+                self.server.config.database_path,
+                profile_id=profile_id,
+                revision=revision,
+                actor=viewer.login,
+                reason=reason,
+            )
+        except InvalidProfileRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_profile_request"}
+            )
+            return
+        except ProfileNotFound:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, {"error": "profile_not_found"}
+            )
+            return
+        except ProfileConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "profile_in_use_or_immutable"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK, {"profile": self._profile_response(profile)}
+        )
+
+    @staticmethod
+    def _profile_response(profile: ServerProfile) -> dict[str, object]:
+        return {
+            "profileId": profile.profile_id,
+            "name": profile.name,
+            "revision": profile.revision,
+            "state": profile.state,
+            "definition": profile.definition,
+        }
+
+    @classmethod
+    def _publication_response(
+        cls, publication: ProfilePublication
+    ) -> dict[str, object]:
+        return {
+            "profile": cls._profile_response(publication.profile),
+            "effectiveChanges": publication.effective_changes,
+            "affectedServerIds": publication.affected_server_ids,
+            "configurationHash": publication.configuration_hash,
+        }
+
     def _send_audit_events(self) -> None:
         viewer = self._lab_administrator()
         if viewer is None:
@@ -303,6 +596,229 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
             },
         )
+
+    def _send_collector_profile_configuration(
+        self, server_id: str
+    ) -> None:
+        if not self._verified_collector(server_id):
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"error": "access_denied"}
+            )
+            return
+        try:
+            pending = staged_profile_configuration(
+                self.server.config.database_path, server_id=server_id
+            )
+        except ProfileNotFound:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "profile_configuration_not_staged"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "profileId": pending.profile_id,
+                "revision": pending.revision,
+                "configurationHash": pending.configuration_hash,
+                "configuration": pending.bundle,
+            },
+        )
+
+    def _stage_server_profile(
+        self, server_id: str, *, operation: str
+    ) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        try:
+            request = parse_profile_target(self._read_json())
+            staged = stage_profile_configuration(
+                self.server.config.database_path,
+                server_id=server_id,
+                profile_id=request.profile_id,
+                revision=request.revision,
+                operation=operation,
+                actor=viewer.login,
+                reason=request.reason,
+            )
+        except InvalidProfileRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_profile_request"}
+            )
+            return
+        except ProfileNotFound:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, {"error": "profile_not_found"}
+            )
+            return
+        except ProfileNotPublished:
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "profile_not_published"},
+            )
+            return
+        except ProfileConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "profile_conflict"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.ACCEPTED, self._staged_profile_response(staged)
+        )
+
+    def _record_inventory_observation(self, server_id: str) -> None:
+        if not self._verified_collector(server_id):
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"error": "access_denied"}
+            )
+            return
+        document = self._read_json()
+        try:
+            if (
+                not isinstance(document, dict)
+                or set(document) != {"inventory"}
+            ):
+                raise InvalidFirstContact
+            inventory = server_inventory_from_document(
+                document["inventory"]
+            )
+            pending = record_inventory_observation(
+                self.server.config.database_path,
+                server_id=server_id,
+                inventory=inventory,
+                actor=f"collector:{server_id}",
+                reason="Collector reported current Server Inventory",
+            )
+        except InvalidFirstContact:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_inventory_observation"},
+            )
+            return
+        except ProfileNotFound:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, {"error": "server_not_found"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.ACCEPTED,
+            {
+                "pendingInventoryChange": (
+                    pending.as_document() if pending is not None else None
+                )
+            },
+        )
+
+    def _accept_inventory_change(self, server_id: str) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        try:
+            reason = parse_reason(self._read_json())
+            server = accept_inventory_change(
+                self.server.config.database_path,
+                server_id=server_id,
+                actor=viewer.login,
+                reason=reason,
+            )
+        except InvalidProfileRequest:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_inventory_acceptance"},
+            )
+            return
+        except ProfileConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "inventory_change_not_pending"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {"server": self._administrator_server_response(server)},
+        )
+
+    def _activate_server_profile(self, server_id: str) -> None:
+        if not self._verified_collector(server_id):
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"error": "access_denied"}
+            )
+            return
+        try:
+            request = parse_profile_activation(self._read_json())
+            inventory = server_inventory_from_document(request.inventory)
+            server = activate_staged_profile_configuration(
+                self.server.config.database_path,
+                server_id=server_id,
+                reported_configuration_hash=(
+                    request.reported_configuration_hash
+                ),
+                observations=request.observations,
+                inventory=inventory,
+                actor=f"collector:{server_id}",
+                reason="Collector reported applied configuration hash",
+            )
+        except (InvalidProfileRequest, InvalidFirstContact):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_profile_request"}
+            )
+            return
+        except ProfileConflict:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "profile_activation_not_staged"},
+            )
+            return
+        except ConfigurationHashMismatch as error:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "configuration_hash_mismatch",
+                    "activeProfileRevision": error.active_revision,
+                },
+            )
+            return
+        except StagedProfileVerificationFailed as error:
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {
+                    "error": "profile_requirements_not_verified",
+                    "activeProfileRevision": error.active_revision,
+                },
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {"server": self._administrator_server_response(server)},
+        )
+
+    def _verified_collector(self, server_id: str) -> bool:
+        peer_address = ipaddress.ip_address(self.client_address[0])
+        trusted_peer = any(
+            peer_address in ipaddress.ip_network(network)
+            for network in self.server.config.trusted_proxy_networks
+        )
+        return (
+            trusted_peer
+            and bool(server_id)
+            and "/" not in server_id
+            and self.headers.get("X-Verified-Collector-Server-ID", "")
+            == server_id
+        )
+
+    @staticmethod
+    def _staged_profile_response(
+        staged: StagedProfileConfiguration,
+    ) -> dict[str, object]:
+        return {
+            "profileId": staged.pending.profile_id,
+            "revision": staged.pending.revision,
+            "configurationHash": staged.pending.configuration_hash,
+            "configuration": staged.pending.bundle,
+            "operation": staged.pending.operation,
+            "activeProfileRevision": staged.active_revision,
+        }
 
     def _register_server(self) -> None:
         viewer = self._lab_administrator()
@@ -614,6 +1130,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 {"error": "incomplete_observations"},
             )
             return
+        except ProfileInventoryMismatch:
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "profile_inventory_mismatch"},
+            )
+            return
         except EnrollmentDecisionConflict:
             self._send_json(
                 HTTPStatus.CONFLICT,
@@ -709,6 +1231,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             response["lastObservationResult"] = (
                 server.last_observation_result
             )
+        if server.pending_profile_configuration is not None:
+            pending = server.pending_profile_configuration
+            response["pendingProfileConfiguration"] = {
+                "profileId": pending.profile_id,
+                "revision": pending.revision,
+                "configurationHash": pending.configuration_hash,
+                "operation": pending.operation,
+            }
+        if server.pending_inventory_change is not None:
+            response["pendingInventoryChange"] = (
+                server.pending_inventory_change.as_document()
+            )
+        if server.active_configuration_hash is not None:
+            response["activeConfigurationHash"] = (
+                server.active_configuration_hash
+            )
         return response
 
     def _fleet_server_response(
@@ -753,14 +1291,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 mountpoints,
                 required_observations=profile_required_observations(server),
                 required_services=profile_required_services(server),
+                temperature_sensors=profile_temperature_sensors(server),
             )
         except PrometheusUnavailable:
             observation = unavailable_health_observation(mountpoints)
+        observation["inventoryMatchesProfile"] = (
+            server.pending_inventory_change is None
+        )
         return evaluate_server_health(
             self.server.config.database_path,
             server_id=server.server_id,
             observation=observation,
             now=health_now(),
+            threshold_overrides=profile_threshold_overrides(server),
         )
 
     def _resource_usage(self, server: RegisteredServer) -> ResourceUsage:
@@ -855,6 +1398,21 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 step=step,
                 mountpoint=mountpoint[0],
             )
+            points = history.get("points", [])
+            if isinstance(points, list):
+                for point in points:
+                    if (
+                        not isinstance(point, dict)
+                        or not isinstance(point.get("observedAt"), str)
+                    ):
+                        continue
+                    profile = profile_revision_at(
+                        self.server.config.database_path,
+                        server_id=server_id,
+                        observed_at=point["observedAt"],
+                    )
+                    if profile is not None:
+                        point["profileId"], point["profileRevision"] = profile
         except (InvalidHistoryQuery, TypeError, ValueError):
             self._send_json(
                 HTTPStatus.BAD_REQUEST, {"error": "invalid_history_query"}
