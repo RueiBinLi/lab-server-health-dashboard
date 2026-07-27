@@ -683,6 +683,8 @@ def main() -> None:
     assert "serverIncidents" not in safe_server
     assert "scrapeAddress" not in safe_server
     assert "inventory" not in safe_server
+    assert "enrollmentState" not in safe_server
+    assert safe_server["profile"] == {"name": "General Linux Server"}
     assert "collector" not in safe_server["resourceUsage"]
     assert user_profiles == (403, {"error": "access_denied"})
     assert user_registration == (403, {"error": "access_denied"})

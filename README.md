@@ -85,6 +85,14 @@ not proxied. The dashboard offers only server-scoped CPU, system-memory,
 and disk history queries to authorized viewers, rather than raw Prometheus or
 unrestricted PromQL access.
 
+Application capabilities are mandatory by default. If the deployed Tailscale
+version cannot supply them, fallback must be selected explicitly with
+`DASHBOARD_AUTH_MODE=identity-allowlist` and at least one exact login in
+`DASHBOARD_LAB_ADMINISTRATOR_LOGINS` or `DASHBOARD_LAB_USER_LOGINS`
+(comma-separated). The dashboard does not switch modes automatically; unknown
+and unlisted identities remain denied. Keep the backend loopback-bound in
+either mode.
+
 Daily encrypted backup, isolated restoration, controlled upgrade, and rollback
 procedures are documented in
 [`docs/operations/stack-operations.md`](docs/operations/stack-operations.md).

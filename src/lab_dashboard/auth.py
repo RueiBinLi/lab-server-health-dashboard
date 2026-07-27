@@ -31,15 +31,37 @@ def authorize(
     capabilities_header: str,
     peer_address: str,
     trusted_proxy_networks: tuple[str, ...],
+    auth_mode: str = "capabilities",
+    lab_administrator_logins: tuple[str, ...] = (),
+    lab_user_logins: tuple[str, ...] = (),
 ) -> Viewer | None:
     if not _trusted_peer(peer_address, trusted_proxy_networks):
         return None
     if not _valid_login(login):
         return None
-    role = _role_from_capabilities(capabilities_header)
+    if auth_mode == "identity-allowlist":
+        role = _role_from_allowlist(
+            login, lab_administrator_logins, lab_user_logins
+        )
+    elif auth_mode == "capabilities":
+        role = _role_from_capabilities(capabilities_header)
+    else:
+        return None
     if role is None:
         return None
     return Viewer(login=login, role=role)
+
+
+def _role_from_allowlist(
+    login: str,
+    administrator_logins: tuple[str, ...],
+    user_logins: tuple[str, ...],
+) -> Role | None:
+    if login in administrator_logins and login not in user_logins:
+        return Role.LAB_ADMINISTRATOR
+    if login in user_logins and login not in administrator_logins:
+        return Role.LAB_USER
+    return None
 
 
 def _trusted_peer(peer_address: str, trusted_networks: tuple[str, ...]) -> bool:

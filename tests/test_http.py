@@ -125,6 +125,9 @@ class RunningDashboard:
         self,
         trusted_proxy_networks: tuple[str, ...] = ("127.0.0.0/8",),
         database_path: Path | None = None,
+        auth_mode: str = "capabilities",
+        lab_administrator_logins: tuple[str, ...] = (),
+        lab_user_logins: tuple[str, ...] = (),
     ) -> None:
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = (
             None
@@ -138,6 +141,9 @@ class RunningDashboard:
             DashboardConfig(
                 database_path=database_path,
                 trusted_proxy_networks=trusted_proxy_networks,
+                auth_mode=auth_mode,
+                lab_administrator_logins=lab_administrator_logins,
+                lab_user_logins=lab_user_logins,
                 run_observation_engine=False,
             ),
             ("127.0.0.1", 0),
@@ -211,6 +217,36 @@ class RunningDashboard:
 
 
 class FleetAuthorizationTests(unittest.TestCase):
+    def test_explicit_allowlist_mode_authorizes_known_login_without_capabilities(
+        self,
+    ) -> None:
+        with RunningDashboard(
+            auth_mode="identity-allowlist",
+            lab_user_logins=("lin@example.com",),
+        ) as dashboard:
+            allowed = dashboard.get(
+                "/api/fleet", {"Tailscale-User-Login": "lin@example.com"}
+            )
+            denied = dashboard.get(
+                "/api/fleet", {"Tailscale-User-Login": "eve@example.com"}
+            )
+
+        self.assertEqual(allowed[0], 200)
+        self.assertEqual(allowed[1]["viewer"]["role"], "lab-user")
+        self.assertEqual(denied, (403, {"error": "access_denied"}))
+
+    def test_capability_mode_never_falls_back_to_configured_allowlist(
+        self,
+    ) -> None:
+        with RunningDashboard(
+            lab_user_logins=("lin@example.com",),
+        ) as dashboard:
+            response = dashboard.get(
+                "/api/fleet", {"Tailscale-User-Login": "lin@example.com"}
+            )
+
+        self.assertEqual(response, (403, {"error": "access_denied"}))
+
     def test_lab_administrator_receives_role_appropriate_empty_fleet(self) -> None:
         with RunningDashboard() as dashboard:
             status, body = dashboard.get(
@@ -302,6 +338,37 @@ class FleetAuthorizationTests(unittest.TestCase):
         self.assertEqual(user_status, 200)
         self.assertIn("No servers are available yet.", user_page)
         self.assertNotIn("Lab Administrator controls", user_page)
+        self.assertIn("Healthy</span><strong>0", user_page)
+        self.assertIn("Degraded</span><strong>0", user_page)
+        self.assertIn("Unavailable</span><strong>0", user_page)
+        self.assertIn("@media (min-width: 52rem)", user_page)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", user_page)
+        self.assertIn("@media (max-width: 51.99rem)", user_page)
+        self.assertIn('.server[data-href]', user_page)
+        self.assertNotIn("Lab Administrator workspace", user_page)
+
+    def test_administrator_dashboard_has_complete_operational_navigation(
+        self,
+    ) -> None:
+        with RunningDashboard() as dashboard:
+            status, page = dashboard.get_text(
+                "/", identity_headers("ada@example.com", "lab-administrator")
+            )
+
+        self.assertEqual(status, 200)
+        self.assertIn("Lab Administrator workspace", page)
+        for destination in (
+            "Metrics",
+            "Required Services",
+            "Server Incidents",
+            "Critical Errors",
+            "Server Profiles",
+            "Configuration",
+            "Server Enrollment",
+            "Maintenance Windows",
+            "Alert delivery health",
+        ):
+            self.assertIn(f">{destination}<", page)
 
     def test_health_endpoints_do_not_require_identity(self) -> None:
         with RunningDashboard() as dashboard:

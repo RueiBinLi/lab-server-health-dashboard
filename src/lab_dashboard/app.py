@@ -1763,12 +1763,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             response = {
                 "serverId": server.server_id,
                 "displayName": server.display_name,
-                "profile": {
-                    "profileId": server.profile.profile_id,
-                    "name": server.profile.name,
-                    "revision": server.profile.revision,
-                },
-                "enrollmentState": server.enrollment_state,
+                "profile": {"name": server.profile.name},
                 "serverHealth": None,
             }
         if server.enrollment_state in ("active", "re-enrollment-required"):
@@ -1924,7 +1919,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     self.server.config.database_path
                 )
                 if candidate.server_id == server_id
-                and candidate.enrollment_state == "active"
+                and candidate.enrollment_state
+                in ("active", "re-enrollment-required")
             ),
             None,
         )
@@ -2006,6 +2002,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             trusted_proxy_networks=(
                 self.server.config.trusted_proxy_networks
             ),
+            auth_mode=self.server.config.auth_mode,
+            lab_administrator_logins=(
+                self.server.config.lab_administrator_logins
+            ),
+            lab_user_logins=self.server.config.lab_user_logins,
         )
 
     def _collector_source_address(self) -> str:
@@ -2048,30 +2049,91 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 or server.enrollment_state == "active"
             )
         ]
-        if selected_server_id is not None:
-            servers = [
+        selected_server = next(
+            (
                 server
                 for server in servers
                 if server.server_id == selected_server_id
-            ]
-            if not servers:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-                return
-        content = (
-            "".join(
+            ),
+            None,
+        )
+        if selected_server_id is not None and selected_server is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        server_states = {
+            server.server_id: (
+                self._health_evaluation(server)["serverHealth"]["state"]
+                if server.enrollment_state
+                in ("active", "re-enrollment-required")
+                else "Not enrolled"
+            )
+            for server in servers
+        }
+        health_order = {
+            "Unavailable": 0,
+            "Degraded": 1,
+            "Not enrolled": 2,
+            "Healthy": 3,
+        }
+        servers.sort(
+            key=lambda server: (
+                health_order[server_states[server.server_id]],
+                server.display_name.casefold(),
+            )
+        )
+        counts = {
+            state: sum(value == state for value in server_states.values())
+            for state in ("Healthy", "Degraded", "Unavailable")
+        }
+        fleet_content = (
+            '<section class="fleet-grid" aria-label="Selectable server cards">'
+            + "".join(
                 self._server_card(
                     server,
                     viewer.role,
-                    selected=selected_server_id is not None,
+                    selected=False,
                 )
                 for server in servers
             )
+            + "</section>"
             if servers
             else f"""
     <section class="empty" aria-labelledby="empty-heading">
       <h2 id="empty-heading">{experience.message}</h2>
       <p>{experience.guidance}</p>
     </section>"""
+        )
+        content = fleet_content
+        if selected_server is not None:
+            content = (
+                '<div class="dashboard-layout"><aside>'
+                '<h2>Fleet context</h2>'
+                + fleet_content
+                + '</aside><section class="selected-workspace">'
+                + self._server_card(
+                    selected_server, viewer.role, selected=True
+                )
+                + "</section></div>"
+            )
+        administrator_target = (
+            f"/servers/{servers[0].server_id}" if servers else ""
+        )
+        administrator_navigation = (
+            f"""
+    <nav class="administrator-nav" aria-label="Lab Administrator workspace">
+      <strong>Lab Administrator workspace</strong>
+      <a href="{administrator_target}#metrics">Metrics</a>
+      <a href="{administrator_target}#required-services">Required Services</a>
+      <a href="{administrator_target}#server-incidents">Server Incidents</a>
+      <a href="{administrator_target}#critical-errors">Critical Errors</a>
+      <a href="/api/server-profiles">Server Profiles</a>
+      <a href="{administrator_target}#configuration">Configuration</a>
+      <a href="{administrator_target}#enrollment">Server Enrollment</a>
+      <a href="/api/maintenance-windows">Maintenance Windows</a>
+      <a href="/api/notification-channels">Alert delivery health</a>
+    </nav>"""
+            if viewer.role is Role.LAB_ADMINISTRATOR
+            else ""
         )
         page = f"""<!doctype html>
 <html lang="en">
@@ -2082,13 +2144,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
   <style>
     :root {{ color-scheme: light dark; font-family: system-ui, sans-serif; }}
     body {{ margin: 0; background: #101827; color: #eef4ff; }}
-    main {{ max-width: 72rem; margin: auto; padding: clamp(1rem, 5vw, 4rem); }}
+    main {{ max-width: 88rem; margin: auto; padding: clamp(1rem, 5vw, 4rem); }}
     header {{ display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }}
+    a {{ color: #9fc5ff; }}
     .role {{ color: #a9bad4; }}
     .empty {{ margin-top: 3rem; padding: 3rem 1.5rem; text-align: center;
       border: 1px solid #31415c; border-radius: 1rem; background: #172338; }}
-    .server {{ margin-top: 2rem; padding: 1.5rem; border: 1px solid #31415c;
+    .fleet-counts {{ display: grid; grid-template-columns: repeat(3, 1fr);
+      gap: .75rem; margin: 1.5rem 0; }}
+    .fleet-counts div {{ display: flex; justify-content: space-between;
+      padding: 1rem; border: 1px solid #31415c; border-radius: .75rem; }}
+    .fleet-counts strong {{ font-size: 1.35rem; }}
+    .fleet-grid {{ display: grid; gap: 1rem; }}
+    .server {{ padding: 1.5rem; border: 1px solid #31415c;
       border-radius: 1rem; background: #172338; }}
+    .server[data-health="Unavailable"] {{ border-color: #ff8c8c; }}
+    .server[data-health="Degraded"] {{ border-color: #ffd479; }}
     .facts {{ display: grid; grid-template-columns: repeat(auto-fit,
       minmax(13rem, 1fr)); gap: .75rem 1.5rem; }}
     dt {{ color: #a9bad4; }} dd {{ margin: .2rem 0 0; }}
@@ -2102,6 +2173,28 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
       minmax(12rem, 1fr)); gap: .75rem; }}
     .usage div {{ padding: 1rem; border-radius: .6rem; background: #101827; }}
     .history-output {{ min-height: 2rem; white-space: pre-wrap; }}
+    .administrator-nav {{ display: flex; gap: .8rem 1rem; flex-wrap: wrap;
+      align-items: center; margin: 1rem 0 1.5rem; padding: 1rem;
+      border-radius: .75rem; background: #172338; }}
+    .dashboard-layout {{ display: grid; gap: 1.5rem; }}
+    .dashboard-layout aside .server {{ padding: 1rem; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ padding: .6rem; text-align: left; overflow-wrap: anywhere; }}
+    @media (min-width: 52rem) {{
+      .fleet-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .dashboard-layout {{
+        grid-template-columns: minmax(20rem, 2fr) minmax(0, 3fr);
+      }}
+      .dashboard-layout aside .fleet-grid {{ grid-template-columns: 1fr; }}
+    }}
+    @media (max-width: 51.99rem) {{
+      .fleet-counts {{ grid-template-columns: 1fr; }}
+      .dashboard-layout {{ grid-template-columns: 1fr; }}
+      table, thead, tbody, tr, th, td {{ display: block; }}
+      thead {{ position: absolute; clip: rect(0 0 0 0); }}
+      tr {{ padding: .5rem 0; border-bottom: 1px solid #31415c; }}
+      td {{ padding: .2rem 0; }}
+    }}
   </style>
 </head>
 <body>
@@ -2121,12 +2214,24 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         {escape(viewer.login)}
       </p>
     </header>
+    <section class="fleet-counts" aria-label="Fleet Server Health counts">
+      <div><span>Healthy</span><strong>{counts["Healthy"]}</strong></div>
+      <div><span>Degraded</span><strong>{counts["Degraded"]}</strong></div>
+      <div><span>Unavailable</span><strong>{counts["Unavailable"]}</strong></div>
+    </section>
+    {administrator_navigation}
     {content}
   </main>
   <script>
     document.addEventListener("click", async (event) => {{
       const button = event.target.closest("button[data-server-id]");
-      if (!button) return;
+      if (!button) {{
+        const card = event.target.closest(".server[data-href]");
+        if (card && !event.target.closest("a, button, input, select")) {{
+          window.location.assign(card.dataset.href);
+        }}
+        return;
+      }}
       const serverId = button.dataset.serverId;
       if (button.dataset.action === "history") {{
         const workspace = button.closest(".history");
@@ -2188,6 +2293,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         window.alert(failure.error);
       }}
       window.location.reload();
+    }});
+    document.addEventListener("keydown", (event) => {{
+      const card = event.target.closest(".server[data-href]");
+      if (card && (event.key === "Enter" || event.key === " ")) {{
+        event.preventDefault();
+        window.location.assign(card.dataset.href);
+      }}
     }});
   </script>
 </body>
@@ -2256,9 +2368,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
       <h3>Verified Server Inventory</h3>
       <pre>{escape(json.dumps(server.inventory.as_document(), indent=2, sort_keys=True))}</pre>"""
         usage_html = ""
-        if server.enrollment_state == "active":
+        health_state = "Not enrolled"
+        if server.enrollment_state in ("active", "re-enrollment-required"):
             evaluation = self._health_evaluation(server)
             health = evaluation["serverHealth"]
+            health_state = health["state"]
             health_html = (
                 "<h3>Server Health</h3><p><strong>"
                 + escape(health["state"])
@@ -2305,25 +2419,29 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             filesystems = usage["filesystems"]
             gpu = usage.get("gpu")
-            gpu_html = ""
+            gpu_utilization = "Missing"
+            gpu_vram = "Missing"
+            gpu_headroom = ""
             if gpu is not None:
-                headroom = (
-                    " · Low VRAM headroom"
+                gpu_utilization = _format_percent(
+                    gpu["utilizationPercent"]
+                )
+                gpu_vram = _format_capacity(
+                    gpu["vramUsedBytes"], gpu["vramTotalBytes"]
+                )
+                gpu_headroom = (
+                    " · Low headroom"
                     if gpu["lowVramHeadroom"] is True
                     else ""
                 )
-                gpu_html = (
-                    "<div><strong>GPU</strong><br>"
-                    + escape(_format_percent(gpu["utilizationPercent"]))
-                    + " · VRAM "
-                    + escape(
-                        _format_capacity(
-                            gpu["vramUsedBytes"], gpu["vramTotalBytes"]
-                        )
-                    )
-                    + escape(headroom)
-                    + "</div>"
-                )
+            gpu_html = (
+                "<div><strong>GPU</strong><br>"
+                + escape(gpu_utilization)
+                + "</div><div><strong>GPU VRAM</strong><br>"
+                + escape(gpu_vram)
+                + escape(gpu_headroom)
+                + "</div>"
+            )
             disks = "".join(
                 (
                     "<div><strong>Disk "
@@ -2405,7 +2523,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             usage_html = f"""
       {health_html}
-      <h3>Resource Usage</h3>
+      <h3 id="metrics">Resource Usage</h3>
       <div class="usage">
         <div><strong>CPU</strong><br>{escape(cpu)}</div>
         <div><strong>System memory</strong><br>{escape(memory_value)}
@@ -2418,10 +2536,49 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         {administrator_collector}
       </div>
       {history_html}"""
+            if role is Role.LAB_ADMINISTRATOR and selected:
+                required_service_items = "".join(
+                    f"<li>{escape(service)}</li>"
+                    for service in profile_required_services(server)
+                )
+                usage_html += f"""
+      <section aria-label="Operational detail">
+        <h3 id="required-services">Required Services</h3>
+        <ul>{required_service_items or "<li>None configured</li>"}</ul>
+        <h3 id="server-incidents">Server Incidents</h3>
+        <p>The complete incident timeline appears with Server Health.</p>
+        <h3 id="critical-errors">Critical Errors</h3>
+        <p>Allowlisted Critical Errors appear in active health-rule causes.</p>
+        <h3 id="configuration">Configuration</h3>
+        <p>Active configuration hash: {
+                    escape(server.active_configuration_hash or "Not active")
+                }</p>
+        <h3 id="enrollment">Server Enrollment</h3>
+        <p>Enrollment state: {escape(server.enrollment_state)}</p>
+      </section>"""
+        metadata = (
+            "Server ID: "
+            + escape(server.server_id)
+            + " · Server Profile: "
+            + escape(server.profile.name)
+            + " revision "
+            + str(server.profile.revision)
+            + " · Enrollment: "
+            + state
+            if role is Role.LAB_ADMINISTRATOR
+            else "Server Profile: " + escape(server.profile.name)
+        )
+        selectable_attributes = (
+            ' role="link" tabindex="0" data-href="/servers/'
+            + escape(server.server_id, quote=True)
+            + '"'
+            if not selected
+            else ""
+        )
         return f"""
-    <article class="server">
+    <article class="server" data-health="{escape(health_state)}"{selectable_attributes}>
       <h2>{heading}</h2>
-      <p>Server ID: {escape(server.server_id)} · Enrollment: {state}</p>
+      <p>{metadata}</p>
       {usage_html}
       {review_html}
     </article>"""

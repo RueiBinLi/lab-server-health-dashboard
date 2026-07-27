@@ -11,6 +11,9 @@ from pathlib import Path
 class DashboardConfig:
     database_path: Path
     trusted_proxy_networks: tuple[str, ...]
+    auth_mode: str = "capabilities"
+    lab_administrator_logins: tuple[str, ...] = ()
+    lab_user_logins: tuple[str, ...] = ()
     prometheus_url: str = "http://127.0.0.1:9090"
     public_url: str = "http://127.0.0.1:3000"
     run_observation_engine: bool = True
@@ -36,6 +39,21 @@ def load_config(environment: Mapping[str, str] | None = None) -> DashboardConfig
             ipaddress.ip_network(network)
     except ValueError as error:
         raise ConfigurationError("trusted proxy networks are invalid") from error
+    auth_mode = values.get("DASHBOARD_AUTH_MODE", "capabilities")
+    if auth_mode not in {"capabilities", "identity-allowlist"}:
+        raise ConfigurationError("authentication mode is invalid")
+    administrator_logins = _comma_separated(
+        values.get("DASHBOARD_LAB_ADMINISTRATOR_LOGINS", "")
+    )
+    user_logins = _comma_separated(
+        values.get("DASHBOARD_LAB_USER_LOGINS", "")
+    )
+    if auth_mode == "identity-allowlist" and not (
+        administrator_logins or user_logins
+    ):
+        raise ConfigurationError("allowlist identities are required")
+    if set(administrator_logins) & set(user_logins):
+        raise ConfigurationError("allowlist roles must not overlap")
 
     return DashboardConfig(
         database_path=Path(
@@ -45,10 +63,19 @@ def load_config(environment: Mapping[str, str] | None = None) -> DashboardConfig
             )
         ),
         trusted_proxy_networks=trusted_proxy_networks,
+        auth_mode=auth_mode,
+        lab_administrator_logins=administrator_logins,
+        lab_user_logins=user_logins,
         prometheus_url=values.get(
             "DASHBOARD_PROMETHEUS_URL", "http://127.0.0.1:9090"
         ).rstrip("/"),
         public_url=values.get(
             "DASHBOARD_PUBLIC_URL", "http://127.0.0.1:3000"
         ).rstrip("/"),
+    )
+
+
+def _comma_separated(value: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
     )
