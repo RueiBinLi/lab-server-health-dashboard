@@ -10,6 +10,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from lab_dashboard.enrollment import (
+    EnrollmentDecision,
+    EnrollmentDecisionKind,
+    ServerInventory,
+    server_inventory_from_document,
+)
+
 
 BOOTSTRAP_TOKEN_TTL_SECONDS = 15 * 60
 
@@ -76,12 +83,45 @@ class ServerProfile:
 
 
 @dataclass(frozen=True)
+class ObservationCheck:
+    observation: str
+    present: bool
+
+
+@dataclass(frozen=True)
+class EnrollmentReview:
+    verification_code: str
+    source_address: str
+    inventory: ServerInventory
+    observation_checks: tuple[ObservationCheck, ...]
+    ready_for_approval: bool
+
+
+@dataclass(frozen=True)
+class RejectedEnrollment:
+    collector_public_key_fingerprint: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ObservationTarget:
+    server_id: str
+    scrape_address: str
+    scrape_client_certificate_path: str
+    scrape_client_key_path: str
+
+
+@dataclass(frozen=True)
 class RegisteredServer:
     server_id: str
     display_name: str
     scrape_address: str
     profile: ServerProfile
     enrollment_state: str
+    enrollment_review: EnrollmentReview | None
+    inventory: ServerInventory | None
+    last_rejected_enrollment: RejectedEnrollment | None
+    last_observation_result: str | None
 
 
 class DisplayNameConflict(Exception):
@@ -97,6 +137,18 @@ class ServerNotAwaitingFirstContact(Exception):
 
 
 class InvalidBootstrapCredentials(Exception):
+    pass
+
+
+class EnrollmentDecisionConflict(Exception):
+    pass
+
+
+class VerificationCodeMismatch(Exception):
+    pass
+
+
+class IncompleteObservations(Exception):
     pass
 
 
@@ -171,7 +223,7 @@ def initialize_database(path: Path) -> None:
                 """
                 CREATE TABLE IF NOT EXISTS collector_certificates (
                     server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
-                    certificate_fingerprint TEXT NOT NULL,
+                    collector_public_key_fingerprint TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 )
                 """
@@ -187,6 +239,60 @@ def initialize_database(path: Path) -> None:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_enrollments (
+                    server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
+                    source_address TEXT NOT NULL,
+                    inventory_json TEXT NOT NULL,
+                    observations_json TEXT NOT NULL,
+                    verification_code TEXT NOT NULL,
+                    first_contact_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verified_server_inventory (
+                    server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
+                    inventory_json TEXT NOT NULL,
+                    verified_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_scrape_targets (
+                    server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
+                    scrape_address TEXT NOT NULL,
+                    activated_at TEXT NOT NULL,
+                    scrape_client_certificate_path TEXT NOT NULL,
+                    scrape_client_key_path TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS observation_runs (
+                    observation_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id TEXT NOT NULL REFERENCES servers(server_id),
+                    observed_at TEXT NOT NULL,
+                    result TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS revoked_collector_fingerprints (
+                    collector_public_key_fingerprint TEXT PRIMARY KEY,
+                    server_id TEXT NOT NULL REFERENCES servers(server_id),
+                    revoked_at TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL
+                )
+                """
+            )
+            _rename_legacy_fingerprint_columns(connection)
             for profile_id, revision, name, definition in SEEDED_PROFILES:
                 encoded_definition = json.dumps(
                     definition, separators=(",", ":")
@@ -268,6 +374,30 @@ def _add_server_columns(connection: sqlite3.Connection) -> None:
             )
 
 
+def _rename_legacy_fingerprint_columns(
+    connection: sqlite3.Connection,
+) -> None:
+    for table in (
+        "collector_certificates",
+        "revoked_collector_fingerprints",
+    ):
+        columns = {
+            row["name"]
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if (
+            "certificate_fingerprint" in columns
+            and "collector_public_key_fingerprint" not in columns
+        ):
+            connection.execute(
+                f"""
+                ALTER TABLE {table}
+                RENAME COLUMN certificate_fingerprint
+                TO collector_public_key_fingerprint
+                """
+            )
+
+
 def list_published_profiles(path: Path) -> list[ServerProfile]:
     with closing(_connect(path)) as connection:
         rows = connection.execute(
@@ -345,6 +475,10 @@ def register_server(
         scrape_address=scrape_address,
         profile=_profile_from_row(profile_row),
         enrollment_state="awaiting-first-contact",
+        enrollment_review=None,
+        inventory=None,
+        last_rejected_enrollment=None,
+        last_observation_result=None,
     )
 
 
@@ -451,15 +585,35 @@ def consume_bootstrap_token(
     *,
     server_id: str,
     token: str,
-    certificate_fingerprint: str,
+    collector_public_key_fingerprint: str,
     certificate_expires_at: datetime,
     scrape_client_certificate_path: str,
     scrape_client_key_path: str,
+    source_address: str,
+    inventory: ServerInventory,
+    verification_code: str,
 ) -> None:
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     occurred_at = _now()
     with closing(_connect(path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
+        revoked = connection.execute(
+            """
+            SELECT 1
+            FROM revoked_collector_fingerprints
+            WHERE collector_public_key_fingerprint = ?
+            """,
+            (collector_public_key_fingerprint,),
+        ).fetchone()
+        if revoked is not None:
+            _record_bootstrap_failure(
+                connection,
+                occurred_at,
+                server_id,
+                "revoked-collector-fingerprint",
+            )
+            connection.commit()
+            raise InvalidBootstrapCredentials
         if not _bootstrap_token_is_usable(
             connection,
             server_id=server_id,
@@ -505,12 +659,12 @@ def consume_bootstrap_token(
         connection.execute(
             """
             INSERT INTO collector_certificates (
-                server_id, certificate_fingerprint, expires_at
+                server_id, collector_public_key_fingerprint, expires_at
             ) VALUES (?, ?, ?)
             """,
             (
                 server_id,
-                certificate_fingerprint,
+                collector_public_key_fingerprint,
                 certificate_expires_at.isoformat(),
             ),
         )
@@ -527,6 +681,24 @@ def consume_bootstrap_token(
                 occurred_at.isoformat(),
                 scrape_client_certificate_path,
                 scrape_client_key_path,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO pending_enrollments (
+                server_id, source_address, inventory_json,
+                observations_json, verification_code, first_contact_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                server_id,
+                source_address,
+                json.dumps(
+                    inventory.as_document(), separators=(",", ":")
+                ),
+                "[]",
+                verification_code,
+                occurred_at.isoformat(),
             ),
         )
         _insert_audit_event(
@@ -649,18 +821,54 @@ def server_requires_nvidia(path: Path, *, server_id: str) -> bool:
     return capabilities.get("gpu") is True
 
 
+def server_scrape_address(path: Path, *, server_id: str) -> str:
+    with closing(_connect(path)) as connection:
+        row = connection.execute(
+            "SELECT scrape_address FROM servers WHERE server_id = ?",
+            (server_id,),
+        ).fetchone()
+    if row is None:
+        raise ServerNotAwaitingFirstContact
+    return cast(str, row["scrape_address"])
+
+
 def list_registered_servers(path: Path) -> list[RegisteredServer]:
     with closing(_connect(path)) as connection:
         rows = connection.execute(
             """
             SELECT
-                server_id, display_name, scrape_address,
-                enrollment_state, p.profile_id, p.revision, p.name,
-                p.state, p.definition_json
+                s.server_id, s.display_name, s.scrape_address,
+                s.enrollment_state, p.profile_id, p.revision, p.name,
+                p.state, p.definition_json,
+                pe.source_address, pe.inventory_json AS pending_inventory_json,
+                pe.observations_json, pe.verification_code,
+                vi.inventory_json AS verified_inventory_json,
+                rejected.collector_public_key_fingerprint
+                    AS rejected_fingerprint,
+                rejected.reason AS rejection_reason,
+                (
+                    SELECT runs.result
+                    FROM observation_runs AS runs
+                    WHERE runs.server_id = s.server_id
+                    ORDER BY runs.observation_run_id DESC
+                    LIMIT 1
+                ) AS last_observation_result
             FROM servers AS s
             JOIN server_profiles AS p
               ON p.profile_id = s.profile_id
              AND p.revision = s.profile_revision
+            LEFT JOIN pending_enrollments AS pe
+              ON pe.server_id = s.server_id
+            LEFT JOIN verified_server_inventory AS vi
+              ON vi.server_id = s.server_id
+            LEFT JOIN revoked_collector_fingerprints AS rejected
+              ON rejected.collector_public_key_fingerprint = (
+                SELECT latest.collector_public_key_fingerprint
+                FROM revoked_collector_fingerprints AS latest
+                WHERE latest.server_id = s.server_id
+                ORDER BY latest.revoked_at DESC
+                LIMIT 1
+              )
             ORDER BY s.created_at, s.server_id
             """
         ).fetchall()
@@ -671,9 +879,411 @@ def list_registered_servers(path: Path) -> list[RegisteredServer]:
             scrape_address=row["scrape_address"],
             profile=_profile_from_row(row),
             enrollment_state=row["enrollment_state"],
+            enrollment_review=_enrollment_review_from_row(row),
+            inventory=(
+                server_inventory_from_document(
+                    json.loads(row["verified_inventory_json"])
+                )
+                if row["verified_inventory_json"] is not None
+                else None
+            ),
+            last_rejected_enrollment=(
+                RejectedEnrollment(
+                    collector_public_key_fingerprint=(
+                        row["rejected_fingerprint"]
+                    ),
+                    reason=row["rejection_reason"],
+                )
+                if row["rejected_fingerprint"] is not None
+                else None
+            ),
+            last_observation_result=row["last_observation_result"],
         )
         for row in rows
     ]
+
+
+def get_staging_observation_target(
+    path: Path, *, server_id: str
+) -> ObservationTarget:
+    with closing(_connect(path)) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                server_id, scrape_address,
+                scrape_client_certificate_path, scrape_client_key_path
+            FROM staging_scrape_targets
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+    if row is None:
+        raise EnrollmentDecisionConflict
+    return _observation_target_from_row(row)
+
+
+def list_active_observation_targets(path: Path) -> list[ObservationTarget]:
+    with closing(_connect(path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                server_id, scrape_address,
+                scrape_client_certificate_path, scrape_client_key_path
+            FROM active_scrape_targets
+            ORDER BY server_id
+            """
+        ).fetchall()
+    return [_observation_target_from_row(row) for row in rows]
+
+
+def _observation_target_from_row(
+    row: sqlite3.Row,
+) -> ObservationTarget:
+    return ObservationTarget(
+        server_id=row["server_id"],
+        scrape_address=row["scrape_address"],
+        scrape_client_certificate_path=(
+            row["scrape_client_certificate_path"]
+        ),
+        scrape_client_key_path=row["scrape_client_key_path"],
+    )
+
+
+def record_staged_observations(
+    path: Path,
+    *,
+    server_id: str,
+    observations: set[str],
+    actor: str,
+) -> RegisteredServer:
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        updated = connection.execute(
+            """
+            UPDATE pending_enrollments
+            SET observations_json = ?
+            WHERE server_id = ?
+              AND EXISTS (
+                SELECT 1
+                FROM servers
+                WHERE server_id = ?
+                  AND enrollment_state = 'pending-verification'
+              )
+            """,
+            (
+                json.dumps(sorted(observations), separators=(",", ":")),
+                server_id,
+                server_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            connection.rollback()
+            raise EnrollmentDecisionConflict
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action="staged-telemetry-check",
+            server_id=server_id,
+            reason="Check staged collector telemetry",
+            result="succeeded",
+        )
+        connection.commit()
+    server = _registered_server(path, server_id)
+    if server is None:
+        raise EnrollmentDecisionConflict
+    return server
+
+
+def record_observation_run(
+    path: Path,
+    *,
+    server_id: str,
+    result: str,
+) -> None:
+    with closing(_connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO observation_runs (
+                    server_id, observed_at, result
+                ) VALUES (?, ?, ?)
+                """,
+                (server_id, _now().isoformat(), result),
+            )
+
+
+def decide_enrollment(
+    path: Path,
+    *,
+    server_id: str,
+    actor: str,
+    decision: EnrollmentDecision,
+) -> RegisteredServer:
+    occurred_at = _now()
+    audit_action = (
+        "enrollment-approval"
+        if decision.kind is EnrollmentDecisionKind.APPROVE
+        else "enrollment-rejection"
+    )
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        pending = connection.execute(
+            """
+            SELECT
+                s.enrollment_state, pe.inventory_json,
+                pe.observations_json, pe.verification_code,
+                p.definition_json,
+                cc.collector_public_key_fingerprint
+            FROM servers AS s
+            JOIN pending_enrollments AS pe
+              ON pe.server_id = s.server_id
+            JOIN server_profiles AS p
+              ON p.profile_id = s.profile_id
+             AND p.revision = s.profile_revision
+            JOIN collector_certificates AS cc
+              ON cc.server_id = s.server_id
+            WHERE s.server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        if pending is None or pending["enrollment_state"] != (
+            "pending-verification"
+        ):
+            connection.rollback()
+            raise EnrollmentDecisionConflict
+        if not secrets.compare_digest(
+            pending["verification_code"], decision.verification_code
+        ):
+            _insert_audit_event(
+                connection,
+                occurred_at=occurred_at.isoformat(),
+                actor=actor,
+                action=audit_action,
+                server_id=server_id,
+                reason=decision.reason,
+                result="verification-code-mismatch",
+            )
+            connection.commit()
+            raise VerificationCodeMismatch
+        if decision.kind is EnrollmentDecisionKind.APPROVE:
+            _approve_pending_enrollment(
+                connection,
+                pending=pending,
+                server_id=server_id,
+                occurred_at=occurred_at,
+                actor=actor,
+                reason=decision.reason,
+                audit_action=audit_action,
+            )
+        else:
+            _reject_pending_enrollment(
+                connection,
+                collector_public_key_fingerprint=(
+                    pending["collector_public_key_fingerprint"]
+                ),
+                server_id=server_id,
+                occurred_at=occurred_at,
+                actor=actor,
+                reason=decision.reason,
+            )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action=audit_action,
+            server_id=server_id,
+            reason=decision.reason,
+            result="succeeded",
+        )
+        connection.commit()
+    return _require_registered_server(path, server_id)
+
+
+def _approve_pending_enrollment(
+    connection: sqlite3.Connection,
+    *,
+    pending: sqlite3.Row,
+    server_id: str,
+    occurred_at: datetime,
+    actor: str,
+    reason: str,
+    audit_action: str,
+) -> None:
+    definition = cast(
+        dict[str, object], json.loads(pending["definition_json"])
+    )
+    required = set(_profile_observations(definition))
+    present = set(
+        cast(list[str], json.loads(pending["observations_json"]))
+    )
+    if not required <= present:
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor=actor,
+            action=audit_action,
+            server_id=server_id,
+            reason=reason,
+            result="incomplete-observations",
+        )
+        connection.commit()
+        raise IncompleteObservations
+    connection.execute(
+        """
+        INSERT INTO verified_server_inventory (
+            server_id, inventory_json, verified_at
+        ) VALUES (?, ?, ?)
+        """,
+        (server_id, pending["inventory_json"], occurred_at.isoformat()),
+    )
+    activated = connection.execute(
+        """
+        INSERT INTO active_scrape_targets (
+            server_id, scrape_address, activated_at,
+            scrape_client_certificate_path, scrape_client_key_path
+        )
+        SELECT
+            server_id, scrape_address, ?,
+            scrape_client_certificate_path, scrape_client_key_path
+        FROM staging_scrape_targets
+        WHERE server_id = ?
+        """,
+        (occurred_at.isoformat(), server_id),
+    )
+    if activated.rowcount != 1:
+        connection.rollback()
+        raise EnrollmentDecisionConflict
+    connection.execute(
+        "DELETE FROM staging_scrape_targets WHERE server_id = ?",
+        (server_id,),
+    )
+    connection.execute(
+        "DELETE FROM pending_enrollments WHERE server_id = ?",
+        (server_id,),
+    )
+    connection.execute(
+        """
+        UPDATE servers
+        SET enrollment_state = 'active'
+        WHERE server_id = ?
+        """,
+        (server_id,),
+    )
+
+
+def _reject_pending_enrollment(
+    connection: sqlite3.Connection,
+    *,
+    collector_public_key_fingerprint: str,
+    server_id: str,
+    occurred_at: datetime,
+    actor: str,
+    reason: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO revoked_collector_fingerprints (
+            collector_public_key_fingerprint,
+            server_id, revoked_at, actor, reason
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            collector_public_key_fingerprint,
+            server_id,
+            occurred_at.isoformat(),
+            actor,
+            reason,
+        ),
+    )
+    connection.execute(
+        "DELETE FROM collector_certificates WHERE server_id = ?",
+        (server_id,),
+    )
+    connection.execute(
+        "DELETE FROM staging_scrape_targets WHERE server_id = ?",
+        (server_id,),
+    )
+    connection.execute(
+        "DELETE FROM pending_enrollments WHERE server_id = ?",
+        (server_id,),
+    )
+    connection.execute(
+        """
+        UPDATE servers
+        SET enrollment_state = 'awaiting-first-contact'
+        WHERE server_id = ?
+        """,
+        (server_id,),
+    )
+
+
+def _require_registered_server(
+    path: Path, server_id: str
+) -> RegisteredServer:
+    server = _registered_server(path, server_id)
+    if server is None:
+        raise EnrollmentDecisionConflict
+    return server
+
+
+def _registered_server(
+    path: Path, server_id: str
+) -> RegisteredServer | None:
+    return next(
+        (
+            server
+            for server in list_registered_servers(path)
+            if server.server_id == server_id
+        ),
+        None,
+    )
+
+
+def _enrollment_review_from_row(
+    row: sqlite3.Row,
+) -> EnrollmentReview | None:
+    if row["verification_code"] is None:
+        return None
+    definition = cast(
+        dict[str, object], json.loads(row["definition_json"])
+    )
+    required = _profile_observations(definition)
+    present = set(cast(list[str], json.loads(row["observations_json"])))
+    checks = tuple(
+        ObservationCheck(
+            observation=observation,
+            present=observation in present,
+        )
+        for observation in required
+    )
+    return EnrollmentReview(
+        verification_code=row["verification_code"],
+        source_address=row["source_address"],
+        inventory=server_inventory_from_document(
+            json.loads(row["pending_inventory_json"])
+        ),
+        observation_checks=checks,
+        ready_for_approval=all(check.present for check in checks),
+    )
+
+
+def _profile_observations(
+    definition: dict[str, object],
+) -> list[str]:
+    required = list(
+        cast(list[str], definition["requiredObservations"])
+    )
+    required.extend(
+        f"persistent-mount:{mount}"
+        for mount in cast(list[str], definition["persistentMounts"])
+    )
+    required.extend(
+        f"required-service:{service}"
+        for service in cast(list[str], definition["requiredServices"])
+    )
+    return required
 
 
 def list_audit_events(path: Path) -> list[dict[str, object]]:

@@ -64,11 +64,11 @@ Do not change `DASHBOARD_HOST` to a non-loopback address.
 
 ## Verify the collector installer
 
-The collector installer is pinned at version `1.0.0`. Its offline Ed25519
+The collector installer is pinned at version `1.2.0`. Its offline Ed25519
 signing public key has this SHA-256 fingerprint:
 
 ```text
-f15fe9bb9de08d4255affa754393ff216878ef996347c02c59a61fa871134c22
+a1aa38ed95a8a0409642d2d1775d159dc9005a29441def0a86113f6e6de65942
 ```
 
 Compare that fingerprint with the independently trusted checkout before using

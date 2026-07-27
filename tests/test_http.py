@@ -56,6 +56,70 @@ def create_csr(directory: Path, common_name: str) -> str:
     return csr_path.read_text()
 
 
+def collector_inventory() -> dict[str, object]:
+    return {
+        "hostname": "compute-1",
+        "osRelease": "Ubuntu 24.04 LTS",
+        "architecture": "x86_64",
+        "cpu": {"model": "AMD EPYC 7313P", "logicalCount": 32},
+        "memory": {"totalBytes": 137_438_953_472},
+        "disks": [
+            {
+                "stableId": "wwn-0x5000c500abcd1234",
+                "model": "Samsung PM9A3",
+                "sizeBytes": 3_840_755_982_336,
+                "mounts": ["/"],
+            }
+        ],
+        "gpus": [],
+        "stableIdentifiers": {
+            "machineId": "8de277067b3544d4b65c267d0edab928",
+            "systemUuid": "4c4c4544-004b-3710-8052-cac04f593332",
+        },
+    }
+
+
+def bootstrap_request(
+    *,
+    server_id: str,
+    token: str,
+    csr: str,
+) -> dict[str, object]:
+    return {
+        "serverId": server_id,
+        "bootstrapToken": token,
+        "certificateSigningRequest": csr,
+        **collector_inventory(),
+    }
+
+
+def public_key_fingerprint_from_csr(csr_path: Path) -> str:
+    public_key_der = subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-in",
+            str(csr_path),
+            "-pubkey",
+            "-noout",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    der = subprocess.run(
+        ["openssl", "pkey", "-pubin", "-outform", "DER"],
+        input=public_key_der,
+        check=True,
+        capture_output=True,
+    ).stdout
+    return hashlib.sha256(der).hexdigest()
+
+
+def verification_code_from_csr(csr_path: Path) -> str:
+    short = public_key_fingerprint_from_csr(csr_path)[:12].upper()
+    return "-".join(short[index : index + 4] for index in range(0, 12, 4))
+
+
 class RunningDashboard:
     def __init__(
         self,
@@ -425,6 +489,408 @@ class ServerRegistrationTests(unittest.TestCase):
 
 
 class CollectorBootstrapTests(unittest.TestCase):
+    def test_first_contact_exposes_matching_code_inventory_and_observations(
+        self,
+    ) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        with tempfile.TemporaryDirectory() as key_directory:
+            directory = Path(key_directory)
+            with RunningDashboard() as dashboard:
+                _, registered = dashboard.post(
+                    "/api/servers",
+                    {
+                        "displayName": "Compute 1",
+                        "scrapeAddress": "https://192.168.10.8:9100/metrics",
+                        "profileId": "general-linux",
+                        "reason": "Add shared compute capacity",
+                    },
+                    administrator,
+                )
+                server_id = registered["server"]["serverId"]
+                csr = create_csr(directory, server_id)
+                _, issued = dashboard.post(
+                    f"/api/servers/{server_id}/bootstrap-tokens",
+                    {"reason": "Install the collector"},
+                    administrator,
+                )
+                first_contact = dashboard.post(
+                    "/api/enrollment/bootstrap",
+                    bootstrap_request(
+                        server_id=server_id,
+                        token=issued["bootstrapToken"],
+                        csr=csr,
+                    ),
+                    {"X-Forwarded-For": "10.40.0.25"},
+                )
+                with patch(
+                    "lab_dashboard.app.scrape_telemetry",
+                    return_value={
+                        "reachability",
+                        "cpu",
+                        "memory",
+                        "root-filesystem",
+                        "temperature-headroom",
+                        "critical-errors",
+                        "persistent-mount:/",
+                    },
+                ):
+                    telemetry_check = dashboard.post(
+                        (
+                            f"/api/servers/{server_id}"
+                            "/staged-telemetry-checks"
+                        ),
+                        {},
+                        administrator,
+                    )
+                _, fleet = dashboard.get("/api/fleet", administrator)
+                page_status, page = dashboard.get_text("/", administrator)
+
+            expected_code = verification_code_from_csr(
+                directory / f"{server_id}.csr"
+            )
+
+        review = fleet["fleet"][0]["enrollmentReview"]
+        self.assertEqual(first_contact[0], 201)
+        self.assertEqual(first_contact[1]["verificationCode"], expected_code)
+        self.assertEqual(review["verificationCode"], expected_code)
+        self.assertEqual(review["sourceAddress"], "10.40.0.25")
+        self.assertEqual(review["inventory"], collector_inventory())
+        self.assertEqual(telemetry_check[0], 200)
+        self.assertEqual(
+            review["observationChecks"],
+            [
+                {"observation": "reachability", "present": True},
+                {"observation": "cpu", "present": True},
+                {"observation": "memory", "present": True},
+                {"observation": "root-filesystem", "present": True},
+                {"observation": "temperature-headroom", "present": True},
+                {"observation": "critical-errors", "present": True},
+                {"observation": "persistent-mount:/", "present": True},
+            ],
+        )
+        self.assertTrue(review["readyForApproval"])
+        self.assertEqual(page_status, 200)
+        for visible_value in (
+            expected_code,
+            "10.40.0.25",
+            "compute-1",
+            "Ubuntu 24.04 LTS",
+            "AMD EPYC 7313P",
+            "137438953472",
+            "Samsung PM9A3",
+            "wwn-0x5000c500abcd1234",
+            "8de277067b3544d4b65c267d0edab928",
+            "Check staged telemetry",
+            "Approve",
+            "Reject",
+        ):
+            self.assertIn(visible_value, page)
+
+    def test_lab_administrator_approves_verified_first_contact_atomically(
+        self,
+    ) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        with tempfile.TemporaryDirectory() as key_directory:
+            with RunningDashboard() as dashboard:
+                _, registered = dashboard.post(
+                    "/api/servers",
+                    {
+                        "displayName": "Compute 1",
+                        "scrapeAddress": "https://192.168.10.8:9100/metrics",
+                        "profileId": "general-linux",
+                        "reason": "Add shared compute capacity",
+                    },
+                    administrator,
+                )
+                server_id = registered["server"]["serverId"]
+                csr = create_csr(Path(key_directory), server_id)
+                _, issued = dashboard.post(
+                    f"/api/servers/{server_id}/bootstrap-tokens",
+                    {"reason": "Install the collector"},
+                    administrator,
+                )
+                _, first_contact = dashboard.post(
+                    "/api/enrollment/bootstrap",
+                    bootstrap_request(
+                        server_id=server_id,
+                        token=issued["bootstrapToken"],
+                        csr=csr,
+                    ),
+                )
+                with patch(
+                    "lab_dashboard.app.scrape_telemetry",
+                    return_value={
+                        "reachability",
+                        "cpu",
+                        "memory",
+                        "root-filesystem",
+                        "temperature-headroom",
+                        "critical-errors",
+                        "persistent-mount:/",
+                    },
+                ):
+                    dashboard.post(
+                        (
+                            f"/api/servers/{server_id}"
+                            "/staged-telemetry-checks"
+                        ),
+                        {},
+                        administrator,
+                    )
+                approval = dashboard.post(
+                    f"/api/servers/{server_id}/enrollment-decisions",
+                    {
+                        "decision": "approve",
+                        "verificationCode": first_contact["verificationCode"],
+                        "reason": "Code and inventory match the intended host",
+                    },
+                    administrator,
+                )
+                _, fleet = dashboard.get("/api/fleet", administrator)
+                reuse = dashboard.post(
+                    "/api/enrollment/bootstrap",
+                    bootstrap_request(
+                        server_id=server_id,
+                        token=issued["bootstrapToken"],
+                        csr=csr,
+                    ),
+                )
+
+        self.assertEqual(approval[0], 200)
+        server = approval[1]["server"]
+        self.assertEqual(server["serverId"], server_id)
+        self.assertEqual(server["enrollmentState"], "active")
+        self.assertEqual(server["observationTargetSet"], "active")
+        self.assertEqual(server["inventory"], collector_inventory())
+        self.assertNotIn("enrollmentReview", server)
+        self.assertEqual(fleet["fleet"], [server])
+        self.assertEqual(
+            reuse, (401, {"error": "invalid_bootstrap_credentials"})
+        )
+
+    def test_approval_waits_for_every_profile_observation(self) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        with tempfile.TemporaryDirectory() as key_directory:
+            with RunningDashboard() as dashboard:
+                _, registered = dashboard.post(
+                    "/api/servers",
+                    {
+                        "displayName": "GPU 1",
+                        "scrapeAddress": "https://192.168.10.9:9100/metrics",
+                        "profileId": "nvidia-gpu-compute",
+                        "reason": "Add GPU capacity",
+                    },
+                    administrator,
+                )
+                server_id = registered["server"]["serverId"]
+                csr = create_csr(Path(key_directory), server_id)
+                _, issued = dashboard.post(
+                    f"/api/servers/{server_id}/bootstrap-tokens",
+                    {"reason": "Install the collector"},
+                    administrator,
+                )
+                request = bootstrap_request(
+                    server_id=server_id,
+                    token=issued["bootstrapToken"],
+                    csr=csr,
+                )
+                request["gpus"] = [
+                    {
+                        "stableId": "GPU-5ee4",
+                        "model": "NVIDIA RTX 6000 Ada",
+                        "memoryBytes": 51_527_139_328,
+                    }
+                ]
+                _, first_contact = dashboard.post(
+                    "/api/enrollment/bootstrap", request
+                )
+                with patch(
+                    "lab_dashboard.app.scrape_telemetry",
+                    return_value={
+                        "reachability",
+                        "cpu",
+                        "memory",
+                        "root-filesystem",
+                        "temperature-headroom",
+                        "critical-errors",
+                        "persistent-mount:/",
+                    },
+                ):
+                    dashboard.post(
+                        (
+                            f"/api/servers/{server_id}"
+                            "/staged-telemetry-checks"
+                        ),
+                        {},
+                        administrator,
+                    )
+                _, pending = dashboard.get("/api/fleet", administrator)
+                approval = dashboard.post(
+                    f"/api/servers/{server_id}/enrollment-decisions",
+                    {
+                        "decision": "approve",
+                        "verificationCode": first_contact["verificationCode"],
+                        "reason": "Review the available staged telemetry",
+                    },
+                    administrator,
+                )
+                _, still_pending = dashboard.get(
+                    "/api/fleet", administrator
+                )
+
+        review = pending["fleet"][0]["enrollmentReview"]
+        self.assertEqual(
+            [
+                check
+                for check in review["observationChecks"]
+                if check["observation"].startswith("gpu-")
+            ],
+            [
+                {"observation": "gpu-utilization", "present": False},
+                {"observation": "gpu-vram", "present": False},
+                {"observation": "gpu-temperature", "present": False},
+                {"observation": "gpu-faults", "present": False},
+            ],
+        )
+        self.assertFalse(review["readyForApproval"])
+        self.assertEqual(
+            approval, (422, {"error": "incomplete_observations"})
+        )
+        self.assertEqual(
+            still_pending["fleet"][0]["enrollmentState"],
+            "pending-verification",
+        )
+        self.assertEqual(
+            still_pending["fleet"][0]["observationTargetSet"], "staging"
+        )
+
+    def test_lab_administrator_rejects_and_revokes_mismatched_collector(
+        self,
+    ) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        with tempfile.TemporaryDirectory() as key_directory:
+            directory = Path(key_directory)
+            with RunningDashboard() as dashboard:
+                _, registered = dashboard.post(
+                    "/api/servers",
+                    {
+                        "displayName": "Compute 1",
+                        "scrapeAddress": "https://192.168.10.8:9100/metrics",
+                        "profileId": "general-linux",
+                        "reason": "Add shared compute capacity",
+                    },
+                    administrator,
+                )
+                server_id = registered["server"]["serverId"]
+                csr = create_csr(directory, server_id)
+                _, issued = dashboard.post(
+                    f"/api/servers/{server_id}/bootstrap-tokens",
+                    {"reason": "Install the collector"},
+                    administrator,
+                )
+                _, first_contact = dashboard.post(
+                    "/api/enrollment/bootstrap",
+                    bootstrap_request(
+                        server_id=server_id,
+                        token=issued["bootstrapToken"],
+                        csr=csr,
+                    ),
+                )
+                with patch(
+                    "lab_dashboard.app.scrape_telemetry",
+                    return_value={
+                        "reachability",
+                        "cpu",
+                        "memory",
+                        "root-filesystem",
+                        "temperature-headroom",
+                        "critical-errors",
+                        "persistent-mount:/",
+                    },
+                ):
+                    dashboard.post(
+                        (
+                            f"/api/servers/{server_id}"
+                            "/staged-telemetry-checks"
+                        ),
+                        {},
+                        administrator,
+                    )
+                rejection = dashboard.post(
+                    f"/api/servers/{server_id}/enrollment-decisions",
+                    {
+                        "decision": "reject",
+                        "verificationCode": first_contact["verificationCode"],
+                        "reason": "System UUID belongs to a different host",
+                    },
+                    administrator,
+                )
+                reuse = dashboard.post(
+                    "/api/enrollment/bootstrap",
+                    bootstrap_request(
+                        server_id=server_id,
+                        token=issued["bootstrapToken"],
+                        csr=csr,
+                    ),
+                )
+                _, replacement = dashboard.post(
+                    f"/api/servers/{server_id}/bootstrap-tokens",
+                    {"reason": "Retry installation with a new token"},
+                    administrator,
+                )
+                revoked_key_retry = dashboard.post(
+                    "/api/enrollment/bootstrap",
+                    bootstrap_request(
+                        server_id=server_id,
+                        token=replacement["bootstrapToken"],
+                        csr=csr,
+                    ),
+                )
+                _, audit = dashboard.get("/api/audit-events", administrator)
+
+            fingerprint = public_key_fingerprint_from_csr(
+                directory / f"{server_id}.csr"
+            )
+
+        self.assertEqual(rejection[0], 200)
+        server = rejection[1]["server"]
+        self.assertEqual(server["serverId"], server_id)
+        self.assertEqual(server["enrollmentState"], "awaiting-first-contact")
+        self.assertNotIn("observationTargetSet", server)
+        self.assertNotIn("enrollmentReview", server)
+        self.assertEqual(
+            server["lastRejectedEnrollment"],
+            {
+                "collectorPublicKeyFingerprint": fingerprint,
+                "reason": "System UUID belongs to a different host",
+            },
+        )
+        self.assertEqual(
+            reuse, (401, {"error": "invalid_bootstrap_credentials"})
+        )
+        self.assertEqual(
+            revoked_key_retry,
+            (401, {"error": "invalid_bootstrap_credentials"}),
+        )
+        rejection_event = next(
+            event
+            for event in audit["events"]
+            if event["action"] == "enrollment-rejection"
+        )
+        self.assertEqual(rejection_event["result"], "succeeded")
+        self.assertEqual(
+            rejection_event["reason"],
+            "System UUID belongs to a different host",
+        )
+
     def test_lab_administrator_issues_one_time_fifteen_minute_token(self) -> None:
         administrator = identity_headers(
             "ada@example.com", "lab-administrator"
@@ -456,7 +922,7 @@ class CollectorBootstrapTests(unittest.TestCase):
         )
         self.assertEqual(issued["expiresInSeconds"], 900)
         installer = issued["installer"]
-        self.assertEqual(installer["version"], "1.0.0")
+        self.assertEqual(installer["version"], "1.2.0")
         self.assertFalse(installer["requiresNvidia"])
         self.assertEqual(
             installer["signingKeySha256"],
@@ -524,14 +990,11 @@ class CollectorBootstrapTests(unittest.TestCase):
                     {"reason": "Install the collector"},
                     administrator,
                 )
-                request = {
-                    "serverId": server_id,
-                    "bootstrapToken": issued["bootstrapToken"],
-                    "certificateSigningRequest": csr,
-                    "hostname": "compute-1",
-                    "osRelease": "Ubuntu 24.04 LTS",
-                    "architecture": "x86_64",
-                }
+                request = bootstrap_request(
+                    server_id=server_id,
+                    token=issued["bootstrapToken"],
+                    csr=csr,
+                )
                 first = dashboard.post("/api/enrollment/bootstrap", request)
                 reuse = dashboard.post("/api/enrollment/bootstrap", request)
                 _, fleet = dashboard.get("/api/fleet", administrator)
@@ -612,14 +1075,11 @@ class CollectorBootstrapTests(unittest.TestCase):
                         {"reason": "Install the collector"},
                         administrator,
                     )
-                    request = {
-                        "serverId": server_id,
-                        "bootstrapToken": issued["bootstrapToken"],
-                        "certificateSigningRequest": csr,
-                        "hostname": "compute-1",
-                        "osRelease": "Ubuntu 22.04 LTS",
-                        "architecture": "x86_64",
-                    }
+                    request = bootstrap_request(
+                        server_id=server_id,
+                        token=issued["bootstrapToken"],
+                        csr=csr,
+                    )
                     with ThreadPoolExecutor(max_workers=2) as executor:
                         responses = list(
                             executor.map(
@@ -692,16 +1152,13 @@ class CollectorBootstrapTests(unittest.TestCase):
                 )
                 status, body = dashboard.post(
                     "/api/enrollment/bootstrap",
-                    {
-                        "serverId": server_id,
-                        "bootstrapToken": issued["bootstrapToken"],
-                        "certificateSigningRequest": create_csr(
+                    bootstrap_request(
+                        server_id=server_id,
+                        token=issued["bootstrapToken"],
+                        csr=create_csr(
                             Path(key_directory), "different-server"
                         ),
-                        "hostname": "compute-1",
-                        "osRelease": "Ubuntu 24.04 LTS",
-                        "architecture": "x86_64",
-                    },
+                    ),
                 )
                 _, audit = dashboard.get("/api/audit-events", administrator)
 

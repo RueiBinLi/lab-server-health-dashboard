@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import ipaddress
 import os
 import secrets
 import subprocess
@@ -9,6 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 CERTIFICATE_VALIDITY_DAYS = 30
@@ -22,7 +24,8 @@ class InvalidCertificateSigningRequest(Exception):
 class IssuedCertificate:
     certificate: str
     ca_certificate: str
-    fingerprint: str
+    collector_public_key_fingerprint: str
+    verification_code: str
     expires_at: datetime
     scrape_client_ca_certificate: str
     scrape_client_certificate_path: str
@@ -30,7 +33,11 @@ class IssuedCertificate:
 
 
 def issue_collector_certificate(
-    state_directory: Path, *, server_id: str, csr: str
+    state_directory: Path,
+    *,
+    server_id: str,
+    csr: str,
+    scrape_address: str,
 ) -> IssuedCertificate:
     pki_directory = state_directory / "pki"
     ca_key = pki_directory / "collector-ca.key"
@@ -47,6 +54,14 @@ def issue_collector_certificate(
         csr_path = temporary_path / "collector.csr"
         certificate_path = temporary_path / "collector.crt"
         extensions_path = temporary_path / "collector.ext"
+        scrape_host = urlsplit(scrape_address).hostname
+        if scrape_host is None:
+            raise InvalidCertificateSigningRequest
+        try:
+            ipaddress.ip_address(scrape_host)
+            scrape_host_san = f"IP:{scrape_host}"
+        except ValueError:
+            scrape_host_san = f"DNS:{scrape_host}"
         csr_path.write_text(csr)
         extensions_path.write_text(
             "\n".join(
@@ -56,7 +71,8 @@ def issue_collector_certificate(
                     "extendedKeyUsage=critical,clientAuth,serverAuth",
                     (
                         "subjectAltName="
-                        f"URI:urn:lab-server:{server_id},DNS:{server_id}"
+                        f"URI:urn:lab-server:{server_id},DNS:{server_id},"
+                        f"{scrape_host_san}"
                     ),
                 )
             )
@@ -89,6 +105,26 @@ def issue_collector_certificate(
                 f"subject=CN={server_id}"
             ):
                 raise InvalidCertificateSigningRequest
+            public_key_pem = subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-in",
+                    str(csr_path),
+                    "-pubkey",
+                    "-noout",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            ).stdout
+            public_key_der = subprocess.run(
+                ["openssl", "pkey", "-pubin", "-outform", "DER"],
+                input=public_key_pem,
+                check=True,
+                capture_output=True,
+                timeout=10,
+            ).stdout
             subprocess.run(
                 [
                     "openssl",
@@ -121,15 +157,28 @@ def issue_collector_certificate(
     expires_at = datetime.now(UTC) + timedelta(
         days=CERTIFICATE_VALIDITY_DAYS
     )
+    collector_public_key_fingerprint = hashlib.sha256(
+        public_key_der
+    ).hexdigest()
     return IssuedCertificate(
         certificate=certificate,
         ca_certificate=ca_certificate.read_text(),
-        fingerprint=hashlib.sha256(certificate.encode()).hexdigest(),
+        collector_public_key_fingerprint=(
+            collector_public_key_fingerprint
+        ),
+        verification_code=_verification_code(
+            collector_public_key_fingerprint
+        ),
         expires_at=expires_at,
         scrape_client_ca_certificate=scrape_client_ca_certificate,
         scrape_client_certificate_path=str(scrape_client_certificate_path),
         scrape_client_key_path=str(scrape_client_key_path),
     )
+
+
+def _verification_code(fingerprint: str) -> str:
+    short = fingerprint[:12].upper()
+    return "-".join(short[index : index + 4] for index in range(0, 12, 4))
 
 
 def _ensure_collector_ca(
@@ -154,6 +203,10 @@ def _ensure_collector_ca(
                     "-nodes",
                     "-subj",
                     "/CN=Lab Server Health Collector CA",
+                    "-addext",
+                    "basicConstraints=critical,CA:TRUE",
+                    "-addext",
+                    "keyUsage=critical,keyCertSign,cRLSign",
                     "-days",
                     "3650",
                     "-sha256",
@@ -211,6 +264,10 @@ def _ensure_per_server_scrape_client(
                         "-nodes",
                         "-subj",
                         f"/CN=Lab Scrape Client CA {server_id}",
+                        "-addext",
+                        "basicConstraints=critical,CA:TRUE",
+                        "-addext",
+                        "keyUsage=critical,keyCertSign,cRLSign",
                         "-days",
                         "3650",
                         "-sha256",

@@ -11,6 +11,23 @@ INSTALLER = (
 
 
 class CollectorInstallerTests(unittest.TestCase):
+    def test_installer_reports_inventory_and_matching_verification_code(
+        self,
+    ) -> None:
+        source = INSTALLER.read_text()
+
+        self.assertIn('"cpu": cpu', source)
+        self.assertIn('"memory": memory', source)
+        self.assertIn('"disks": disks', source)
+        self.assertIn('"gpus": gpus', source)
+        self.assertIn('"stableIdentifiers": stable_identifiers', source)
+        self.assertIn("lab_critical_errors_total", source)
+        self.assertIn("lab_gpu_utilization_ratio", source)
+        self.assertIn("--collector.textfile.directory", source)
+        self.assertIn("lab-collector-textfile.timer", source)
+        self.assertIn('issued["verificationCode"]', source)
+        self.assertIn("Verification code:", source)
+
     def test_installer_accepts_only_supported_ubuntu_releases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             os_release = Path(temporary_directory) / "os-release"
