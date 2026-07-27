@@ -12,6 +12,7 @@ class DashboardConfig:
     database_path: Path
     trusted_proxy_networks: tuple[str, ...]
     prometheus_url: str = "http://127.0.0.1:9090"
+    public_url: str = "http://127.0.0.1:3000"
     run_observation_engine: bool = True
 
 
@@ -46,5 +47,8 @@ def load_config(environment: Mapping[str, str] | None = None) -> DashboardConfig
         trusted_proxy_networks=trusted_proxy_networks,
         prometheus_url=values.get(
             "DASHBOARD_PROMETHEUS_URL", "http://127.0.0.1:9090"
+        ).rstrip("/"),
+        public_url=values.get(
+            "DASHBOARD_PUBLIC_URL", "http://127.0.0.1:3000"
         ).rstrip("/"),
     )

@@ -122,6 +122,160 @@ def health_now() -> datetime:
     return datetime.now(UTC)
 
 
+def critical_alert_metrics(
+    path: Path, *, now: datetime, administrator_url: str
+) -> str:
+    """Expose only bounded, notification-safe Server Incident fields."""
+    if now.tzinfo is None:
+        raise ValueError("alert metric time must be timezone-aware")
+    lines = [
+        "# HELP lab_server_incident Open Server Incidents for Critical Alerts.",
+        "# TYPE lab_server_incident gauge",
+        "# HELP lab_server_incident_recovery Recent Server Incident recoveries.",
+        "# TYPE lab_server_incident_recovery gauge",
+        "# HELP lab_server_incident_info Notification-safe Server Incident content.",
+        "# TYPE lab_server_incident_info gauge",
+    ]
+    with closing(_connect(path)) as connection:
+        incidents = connection.execute(
+            """
+            SELECT i.incident_id, i.server_id, i.opened_at, i.closed_at,
+                   i.current_severity, s.display_name
+            FROM server_incidents i
+            JOIN servers s ON s.server_id = i.server_id
+            ORDER BY i.incident_id
+            """,
+        ).fetchall()
+        for incident in incidents:
+            transitions = connection.execute(
+                """
+                SELECT occurred_at, severity, causes_json
+                FROM server_incident_transitions
+                WHERE incident_id = ?
+                ORDER BY transition_id
+                """,
+                (incident["incident_id"],),
+            ).fetchall()
+            if not transitions:
+                continue
+            latest = transitions[-1]
+            if incident["closed_at"] is None:
+                transition = _notification_transition(transitions)
+                causes = ", ".join(
+                    _summary(rule)
+                    for rule in cast(list[str], json.loads(latest["causes_json"]))
+                )
+                identity = _alert_identity_labels(
+                    incident,
+                    severity=incident["current_severity"],
+                    transition=transition,
+                )
+                content = _alert_content_labels(
+                    incident,
+                    causes=causes or "No active cause.",
+                    duration=_duration(incident["opened_at"], now),
+                    administrator_url=administrator_url,
+                )
+                lines.append(f"lab_server_incident{{{identity}}} 1")
+                lines.append(f"lab_server_incident_info{{{content}}} 1")
+            elif (
+                now.astimezone(UTC)
+                - datetime.fromisoformat(incident["closed_at"])
+            ).total_seconds() <= 60:
+                identity = _alert_identity_labels(
+                    incident,
+                    severity="Healthy",
+                    transition="recovery",
+                )
+                content = _alert_content_labels(
+                    incident,
+                    causes="No active cause.",
+                    duration=_duration(
+                        incident["opened_at"],
+                        datetime.fromisoformat(incident["closed_at"]),
+                    ),
+                    administrator_url=administrator_url,
+                )
+                lines.append(f"lab_server_incident_recovery{{{identity}}} 1")
+                lines.append(f"lab_server_incident_info{{{content}}} 1")
+    return "\n".join(lines) + "\n"
+
+
+def _notification_transition(transitions: list[sqlite3.Row]) -> str:
+    severity = transitions[0]["severity"]
+    transition = "opening"
+    for row in transitions[1:]:
+        if row["severity"] == severity:
+            continue
+        if row["severity"] == "Unavailable":
+            transition = "escalation"
+        elif row["severity"] == "Degraded":
+            transition = "improvement"
+        severity = row["severity"]
+    return transition
+
+
+def _duration(opened_at: str, now: datetime) -> str:
+    seconds = max(
+        0,
+        int(
+            (
+                now.astimezone(UTC) - datetime.fromisoformat(opened_at)
+            ).total_seconds()
+        ),
+    )
+    hours, remainder = divmod(seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _alert_identity_labels(
+    incident: sqlite3.Row,
+    *,
+    severity: str,
+    transition: str,
+) -> str:
+    values = {
+        "server_id": incident["server_id"],
+        "incident_id": str(incident["incident_id"]),
+        "severity": severity,
+        "transition": transition,
+    }
+    return _encoded_labels(values)
+
+
+def _alert_content_labels(
+    incident: sqlite3.Row,
+    *,
+    causes: str,
+    duration: str,
+    administrator_url: str,
+) -> str:
+    values = {
+        "server_id": incident["server_id"],
+        "incident_id": str(incident["incident_id"]),
+        "server_name": incident["display_name"],
+        "causes": causes,
+        "duration": duration,
+        "maintenance": "No active Maintenance Window.",
+        "administrator_url": (
+            f"{administrator_url}/servers/{incident['server_id']}"
+        ),
+    }
+    return _encoded_labels(values)
+
+
+def _encoded_labels(values: dict[str, object]) -> str:
+    return ",".join(
+        f'{name}="{_prometheus_label(str(value))}"'
+        for name, value in values.items()
+    )
+
+
+def _prometheus_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
 def initialize_health_database(path: Path) -> None:
     with closing(_connect(path)) as connection:
         with connection:

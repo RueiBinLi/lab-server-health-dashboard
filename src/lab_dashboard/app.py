@@ -77,6 +77,7 @@ from lab_dashboard.enrollment import (
 from lab_dashboard.installer import signed_installer
 from lab_dashboard.health import (
     HealthEvaluation,
+    critical_alert_metrics,
     evaluate_server_health,
     health_now,
     initialize_health_database,
@@ -213,6 +214,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/health/ready":
             self._send_readiness()
+            return
+        if path == "/metrics":
+            self._send_critical_alert_metrics()
             return
         if path == "/api/fleet":
             self._send_fleet()
@@ -1881,6 +1885,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._send_json(HTTPStatus.OK, {"status": "ready"})
+
+    def _send_critical_alert_metrics(self) -> None:
+        document = critical_alert_metrics(
+            self.server.config.database_path,
+            now=health_now(),
+            administrator_url=self.server.config.public_url,
+        )
+        self._send_bytes(
+            HTTPStatus.OK,
+            document.encode(),
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
 
     def _send_json(self, status: HTTPStatus, body: object) -> None:
         encoded = json.dumps(body, separators=(",", ":")).encode()

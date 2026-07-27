@@ -14,7 +14,21 @@ Create `/etc/lab-server-health/dashboard.env`:
 
 ```text
 DASHBOARD_PORT=3000
+DASHBOARD_PUBLIC_URL=https://lab-dashboard.example.ts.net
+ALERT_SMTP_SMARTHOST=smtp.example.com:465
+ALERT_SMTP_FROM=lab-alerts@example.com
+ALERT_SMTP_TO=lab-administrators@example.com
+ALERT_SMTP_USERNAME=lab-alerts@example.com
+ALERT_SMTP_PASSWORD_PATH=/etc/lab-server-health/secrets/smtp-password
+ALERT_SLACK_WEBHOOK_PATH=/etc/lab-server-health/secrets/slack-webhook
 ```
+
+Create both credential files as root-owned regular files with mode `0600`.
+The SMTP relay must use TLS, and the Slack file contains the incoming webhook
+URL for the private Lab Administrator channel. The stack refuses to generate
+Alertmanager configuration when either file is missing, empty, or accessible
+by group or other users. Credentials are referenced by protected file path and
+are never copied into generated configuration.
 
 Start and inspect the pinned stack:
 
@@ -64,7 +78,8 @@ tailscale serve --bg \
 
 Do not change `DASHBOARD_HOST` to a non-loopback address.
 Prometheus also listens only on `127.0.0.1:19090`; do not proxy that port through
-Tailscale Serve. The dashboard offers only server-scoped CPU, system-memory,
+Tailscale Serve. Alertmanager listens only on `127.0.0.1:19093` and is likewise
+not proxied. The dashboard offers only server-scoped CPU, system-memory,
 and disk history queries to authorized viewers, rather than raw Prometheus or
 unrestricted PromQL access.
 
@@ -75,6 +90,15 @@ forecasting. Server Incidents retain cause and severity changes for each
 continuous non-Healthy period in SQLite, including across central service
 restarts. Lab Users receive explicit safe explanations; Lab Administrators
 also receive active causes and incident timing.
+
+Alertmanager is the only component that sends Critical Alerts externally.
+It groups and deduplicates by immutable Server ID and Server Incident identity:
+initial Degraded delivery waits 30 seconds, Unavailable and severity transitions
+route immediately, cause additions consolidate for five minutes, open incidents
+repeat every four hours, and a short-lived recovery signal sends immediately.
+Email and Slack are separate receivers with resolved delivery enabled. Delivery
+is best-effort at least once, so downstream test and operational receivers must
+tolerate duplicates.
 
 Resource Usage reports CPU as percent used, memory and persistent filesystems
 as used/total GiB plus percent, and the age of the newest scrape. Missing series

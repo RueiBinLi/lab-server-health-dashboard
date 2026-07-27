@@ -142,6 +142,7 @@ class ServerHealthHttpTests(unittest.TestCase):
                     pending = dashboard.get("/api/fleet", LAB_USER)
                     now += timedelta(minutes=2)
                     unavailable = dashboard.get("/api/fleet", ADMINISTRATOR)
+                    incident_metrics = dashboard.get_text("/metrics")
                     unavailable_page = dashboard.get_text("/", LAB_USER)
                     administrator_workspace = dashboard.get_text(
                         f"/servers/{server_id}", ADMINISTRATOR
@@ -150,6 +151,7 @@ class ServerHealthHttpTests(unittest.TestCase):
                     clearing = dashboard.get("/api/fleet", ADMINISTRATOR)
                     now += timedelta(minutes=1)
                     recovered = dashboard.get("/api/fleet", ADMINISTRATOR)
+                    recovery_metrics = dashboard.get_text("/metrics")
 
         self.assertEqual(
             healthy[1]["fleet"][0]["serverHealth"]["state"], "Healthy"
@@ -159,6 +161,11 @@ class ServerHealthHttpTests(unittest.TestCase):
         )
         active = unavailable[1]["fleet"][0]
         self.assertEqual(active["serverHealth"]["state"], "Unavailable")
+        self.assertIn("lab_server_incident{", incident_metrics[1])
+        self.assertIn(f'server_id="{server_id}"', incident_metrics[1])
+        self.assertIn('transition="opening"', incident_metrics[1])
+        self.assertIn('severity="Unavailable"', incident_metrics[1])
+        self.assertNotIn("error_payload", incident_metrics[1])
         self.assertEqual(
             active["activeHealthCauses"],
             [
@@ -188,6 +195,10 @@ class ServerHealthHttpTests(unittest.TestCase):
         final = recovered[1]["fleet"][0]
         self.assertEqual(final["serverHealth"]["state"], "Healthy")
         self.assertEqual(final["activeHealthCauses"], [])
+        self.assertIn(
+            "lab_server_incident_recovery{", recovery_metrics[1]
+        )
+        self.assertIn('transition="recovery"', recovery_metrics[1])
         self.assertEqual(len(final["serverIncidents"]), 1)
         self.assertEqual(
             final["serverIncidents"][0]["closedAt"], now.isoformat()

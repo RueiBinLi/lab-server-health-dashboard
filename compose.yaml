@@ -13,6 +13,7 @@ services:
       DASHBOARD_PORT: "${DASHBOARD_PORT:-3000}"
       DASHBOARD_TRUSTED_PROXY_CIDRS: 127.0.0.0/8,::1/128
       DASHBOARD_PROMETHEUS_URL: http://127.0.0.1:19090
+      DASHBOARD_PUBLIC_URL: "${DASHBOARD_PUBLIC_URL:-http://127.0.0.1:3000}"
     volumes:
       - dashboard-data:/var/lib/lab-dashboard
     read_only: true
@@ -42,6 +43,73 @@ services:
     cpus: 0.50
     mem_limit: 256m
 
+  alertmanager-config:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lab-server-health-dashboard:0.1.0
+    user: "0:0"
+    network_mode: none
+    command:
+      - python
+      - -m
+      - lab_dashboard.alerting
+      - --output-directory
+      - /var/lib/lab-dashboard
+    environment:
+      ALERT_SMTP_SMARTHOST: "${ALERT_SMTP_SMARTHOST:?required}"
+      ALERT_SMTP_FROM: "${ALERT_SMTP_FROM:?required}"
+      ALERT_SMTP_TO: "${ALERT_SMTP_TO:?required}"
+      ALERT_SMTP_USERNAME: "${ALERT_SMTP_USERNAME:?required}"
+      ALERT_SMTP_PASSWORD_FILE: /run/secrets/smtp-password
+      ALERT_SLACK_WEBHOOK_FILE: /run/secrets/slack-webhook
+    volumes:
+      - dashboard-data:/var/lib/lab-dashboard
+      - type: bind
+        source: "${ALERT_SMTP_PASSWORD_PATH:?required}"
+        target: /run/secrets/smtp-password
+        read_only: true
+      - type: bind
+        source: "${ALERT_SLACK_WEBHOOK_PATH:?required}"
+        target: /run/secrets/slack-webhook
+        read_only: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
+    user: "0:0"
+    network_mode: host
+    command:
+      - --config.file=/var/lib/lab-dashboard/alertmanager.yml
+      - --storage.path=/var/lib/lab-dashboard/alertmanager-data
+      - --web.listen-address=127.0.0.1:19093
+    volumes:
+      - dashboard-data:/var/lib/lab-dashboard
+      - type: bind
+        source: "${ALERT_SMTP_PASSWORD_PATH:?required}"
+        target: /run/secrets/smtp-password
+        read_only: true
+      - type: bind
+        source: "${ALERT_SLACK_WEBHOOK_PATH:?required}"
+        target: /run/secrets/slack-webhook
+        read_only: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    depends_on:
+      alertmanager-config:
+        condition: service_completed_successfully
+    cpus: 0.25
+    mem_limit: 128m
+
   prometheus:
     image: prom/prometheus:v3.11.3-distroless@sha256:cff72a3f49918f41c4b5c8a6174dd8433036bebf7878120da538b3720ba3fa0d
     network_mode: host
@@ -65,6 +133,8 @@ services:
     depends_on:
       dashboard:
         condition: service_healthy
+      alertmanager:
+        condition: service_started
     cpus: 0.50
     mem_limit: 512m
 

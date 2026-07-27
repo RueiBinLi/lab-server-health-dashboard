@@ -620,7 +620,20 @@ def write_scrape_config(
     *,
     collector_ca_path: Path,
 ) -> None:
-    jobs: list[dict[str, object]] = []
+    dashboard_port = os.environ.get("DASHBOARD_PORT", "3000")
+    if not dashboard_port.isdigit():
+        dashboard_port = "3000"
+    jobs: list[dict[str, object]] = [
+        {
+            "job_name": "lab-dashboard-incidents",
+            "scheme": "http",
+            "metrics_path": "/metrics",
+            "scrape_interval": "5s",
+            "static_configs": [
+                {"targets": [f"127.0.0.1:{dashboard_port}"]}
+            ],
+        }
+    ]
     for target in targets:
         address = urllib.parse.urlsplit(target.scrape_address)
         if address.hostname is None:
@@ -654,6 +667,16 @@ def write_scrape_config(
         "global": {
             "scrape_interval": f"{SCRAPE_INTERVAL_SECONDS}s",
             "evaluation_interval": f"{SCRAPE_INTERVAL_SECONDS}s",
+        },
+        "rule_files": ["/var/lib/lab-dashboard/critical-alerts.yml"],
+        "alerting": {
+            "alertmanagers": [
+                {
+                    "static_configs": [
+                        {"targets": ["127.0.0.1:19093"]}
+                    ]
+                }
+            ]
         },
         "scrape_configs": jobs,
     }

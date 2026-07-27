@@ -208,7 +208,21 @@ class PrometheusIngestionTests(unittest.TestCase):
             document = json.loads(path.read_text())
 
         self.assertEqual(document["global"]["scrape_interval"], "30s")
-        job = document["scrape_configs"][0]
+        self.assertEqual(
+            document["alerting"]["alertmanagers"][0]["static_configs"][0][
+                "targets"
+            ],
+            ["127.0.0.1:19093"],
+        )
+        self.assertEqual(
+            document["rule_files"],
+            ["/var/lib/lab-dashboard/critical-alerts.yml"],
+        )
+        self.assertEqual(
+            document["scrape_configs"][0]["static_configs"][0]["targets"],
+            ["127.0.0.1:3000"],
+        )
+        job = document["scrape_configs"][1]
         self.assertEqual(job["static_configs"][0]["targets"], ["10.40.0.8:9100"])
         self.assertEqual(
             job["static_configs"][0]["labels"], {"server_id": "server-1"}
