@@ -124,13 +124,21 @@ class RunningDashboard:
     def __init__(
         self,
         trusted_proxy_networks: tuple[str, ...] = ("127.0.0.0/8",),
+        database_path: Path | None = None,
     ) -> None:
-        self._temporary_directory = tempfile.TemporaryDirectory()
-        directory = Path(self._temporary_directory.name)
+        self._temporary_directory: tempfile.TemporaryDirectory[str] | None = (
+            None
+        )
+        if database_path is None:
+            self._temporary_directory = tempfile.TemporaryDirectory()
+            database_path = (
+                Path(self._temporary_directory.name) / "dashboard.sqlite3"
+            )
         self.server = create_server(
             DashboardConfig(
-                database_path=directory / "dashboard.sqlite3",
+                database_path=database_path,
                 trusted_proxy_networks=trusted_proxy_networks,
+                run_observation_engine=False,
             ),
             ("127.0.0.1", 0),
         )
@@ -144,7 +152,8 @@ class RunningDashboard:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
-        self._temporary_directory.cleanup()
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
 
     @property
     def url(self) -> str:

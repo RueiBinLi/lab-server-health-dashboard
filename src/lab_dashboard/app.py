@@ -30,6 +30,9 @@ from lab_dashboard.database import (
     list_audit_events,
     list_published_profiles,
     list_registered_servers,
+    profile_persistent_mountpoints,
+    profile_required_observations,
+    profile_required_services,
     record_bootstrap_failure,
     record_failed_registration,
     record_staged_observations,
@@ -49,6 +52,12 @@ from lab_dashboard.enrollment import (
     safe_audit_reason,
 )
 from lab_dashboard.installer import signed_installer
+from lab_dashboard.health import (
+    HealthEvaluation,
+    evaluate_server_health,
+    health_now,
+    initialize_health_database,
+)
 from lab_dashboard.observation import (
     ObservationEngine,
     TelemetryUnavailable,
@@ -65,10 +74,12 @@ from lab_dashboard.prometheus import (
     InvalidHistoryQuery,
     PrometheusUnavailable,
     ResourceUsage,
+    current_health_observation,
     current_resource_usage,
     query_metric_history,
     reconcile_prometheus,
     sync_prometheus_config,
+    unavailable_health_observation,
     unavailable_resource_usage,
 )
 
@@ -128,17 +139,20 @@ class DashboardServer(ThreadingHTTPServer):
     observation_engine: ObservationEngine
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
-        self.observation_engine.start()
+        if self.config.run_observation_engine:
+            self.observation_engine.start()
         try:
             super().serve_forever(poll_interval)
         finally:
-            self.observation_engine.stop()
+            if self.config.run_observation_engine:
+                self.observation_engine.stop()
 
 
 def create_server(
     config: DashboardConfig, address: tuple[str, int]
 ) -> DashboardServer:
     initialize_database(config.database_path)
+    initialize_health_database(config.database_path)
     sync_prometheus_config(config.database_path)
     server = DashboardServer(address, DashboardRequestHandler)
     server.config = config
@@ -715,18 +729,42 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "serverHealth": None,
             }
         if server.enrollment_state == "active":
+            evaluation = self._health_evaluation(server)
+            response["serverHealth"] = evaluation["serverHealth"]
+            if role is Role.LAB_ADMINISTRATOR:
+                response["activeHealthCauses"] = evaluation[
+                    "activeHealthCauses"
+                ]
+                response["serverIncidents"] = evaluation["serverIncidents"]
             resource_usage = dict(self._resource_usage(server))
             if role is Role.LAB_USER:
                 resource_usage.pop("collector", None)
             response["resourceUsage"] = resource_usage
         return response
 
-    def _resource_usage(self, server: RegisteredServer) -> ResourceUsage:
-        mounts = server.profile.definition.get("persistentMounts", ["/"])
-        mount_values = mounts if isinstance(mounts, list) else ["/"]
-        mountpoints = tuple(
-            mount for mount in mount_values if isinstance(mount, str)
+    def _health_evaluation(
+        self, server: RegisteredServer
+    ) -> HealthEvaluation:
+        mountpoints = self._persistent_mountpoints(server)
+        try:
+            observation = current_health_observation(
+                self.server.config.prometheus_url,
+                server.server_id,
+                mountpoints,
+                required_observations=profile_required_observations(server),
+                required_services=profile_required_services(server),
+            )
+        except PrometheusUnavailable:
+            observation = unavailable_health_observation(mountpoints)
+        return evaluate_server_health(
+            self.server.config.database_path,
+            server_id=server.server_id,
+            observation=observation,
+            now=health_now(),
         )
+
+    def _resource_usage(self, server: RegisteredServer) -> ResourceUsage:
+        mountpoints = self._persistent_mountpoints(server)
         try:
             return current_resource_usage(
                 self.server.config.prometheus_url,
@@ -735,6 +773,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
         except PrometheusUnavailable:
             return unavailable_resource_usage(mountpoints)
+
+    def _persistent_mountpoints(
+        self, server: RegisteredServer
+    ) -> tuple[str, ...]:
+        return profile_persistent_mountpoints(server)
 
     def _send_server(self, server_id: str) -> None:
         viewer = self._authorized_viewer()
@@ -1086,6 +1129,46 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
       <pre>{escape(json.dumps(server.inventory.as_document(), indent=2, sort_keys=True))}</pre>"""
         usage_html = ""
         if server.enrollment_state == "active":
+            evaluation = self._health_evaluation(server)
+            health = evaluation["serverHealth"]
+            health_html = (
+                "<h3>Server Health</h3><p><strong>"
+                + escape(health["state"])
+                + "</strong> — "
+                + escape(health["explanation"])
+                + "</p>"
+            )
+            if role is Role.LAB_ADMINISTRATOR:
+                causes = evaluation["activeHealthCauses"]
+                cause_items = "".join(
+                    "<li>"
+                    + escape(cause["severity"])
+                    + ": "
+                    + escape(cause["summary"])
+                    + "</li>"
+                    for cause in causes
+                )
+                incidents = evaluation["serverIncidents"]
+                incident_items = "".join(
+                    "<li>Server Incident #"
+                    + str(incident["incidentId"])
+                    + " opened "
+                    + escape(incident["openedAt"])
+                    + (
+                        " and remains open"
+                        if incident["closedAt"] is None
+                        else " and closed " + escape(incident["closedAt"])
+                    )
+                    + "</li>"
+                    for incident in incidents
+                )
+                health_html += (
+                    "<h4>Active health-rule causes</h4><ul>"
+                    + (cause_items or "<li>None</li>")
+                    + "</ul><h4>Server Incident timeline</h4><ul>"
+                    + (incident_items or "<li>No Server Incidents</li>")
+                    + "</ul>"
+                )
             usage = self._resource_usage(server)
             cpu = _format_percent(usage["cpu"]["usedPercent"])
             memory = usage["systemMemory"]
@@ -1168,6 +1251,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             usage_html = f"""
+      {health_html}
       <h3>Resource Usage</h3>
       <div class="usage">
         <div><strong>CPU</strong><br>{escape(cpu)}</div>

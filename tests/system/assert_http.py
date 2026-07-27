@@ -181,6 +181,7 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
 node_cpu_seconds_total{{cpu="0",mode="idle"}} {100 + elapsed * 0.75}
 node_cpu_seconds_total{{cpu="0",mode="user"}} {50 + elapsed * 0.25}
 node_load1 1.5
+node_load5 1.5
 node_memory_MemTotal_bytes 17179869184
 node_memory_MemAvailable_bytes 10737418240
 node_filesystem_size_bytes{{mountpoint="/",fstype="ext4"}} 1099511627776
@@ -645,7 +646,12 @@ def main() -> None:
     assert server["enrollmentState"] == "active"
     assert server["observationTargetSet"] == "active"
     assert server["inventory"]["hostname"] == "system-test-server"
-    assert server["serverHealth"] is None
+    assert server["serverHealth"] == {
+        "state": "Healthy",
+        "explanation": "No active baseline health rules.",
+    }
+    assert server["activeHealthCauses"] == []
+    assert server["serverIncidents"] == []
     assert server["metricHistory"] == []
     assert server["criticalAlerts"] == []
     if expected_server_id is not None:
@@ -672,6 +678,9 @@ def main() -> None:
     assert len(lab_user[1]["fleet"]) == 1
     safe_server = lab_user[1]["fleet"][0]
     assert safe_server["serverId"] == server["serverId"]
+    assert safe_server["serverHealth"] == server["serverHealth"]
+    assert "activeHealthCauses" not in safe_server
+    assert "serverIncidents" not in safe_server
     assert "scrapeAddress" not in safe_server
     assert "inventory" not in safe_server
     assert "collector" not in safe_server["resourceUsage"]

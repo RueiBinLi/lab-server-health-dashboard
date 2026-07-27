@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from lab_dashboard.database import ObservationTarget
 from lab_dashboard.prometheus import (
+    current_health_observation,
     current_resource_usage,
     reconcile_prometheus,
     write_scrape_config,
@@ -17,6 +18,112 @@ from lab_dashboard.prometheus import (
 
 
 class PrometheusIngestionTests(unittest.TestCase):
+    def test_health_observation_preserves_required_values_and_disk_forecast(
+        self,
+    ) -> None:
+        observed_at = datetime(2026, 7, 27, tzinfo=UTC)
+        with patch(
+            "lab_dashboard.prometheus._instant_sample",
+            side_effect=[
+                (observed_at, 1.0),
+                (observed_at, 96.0),
+                (observed_at, 8.0),
+                (observed_at, 12.8),
+                (observed_at, 9.0),
+                (observed_at, 19 * 1024**3),
+                (observed_at, 9.0),
+                (observed_at, 1.0),
+                (observed_at, 1.0),
+                (observed_at, 1.0),
+                (observed_at, 1.0),
+            ],
+        ):
+            observation = current_health_observation(
+                "http://127.0.0.1:9090",
+                "server-1",
+                ("/",),
+                required_observations=(
+                    "reachability",
+                    "cpu",
+                    "memory",
+                    "root-filesystem",
+                    "temperature-headroom",
+                    "critical-errors",
+                ),
+                required_services=("sshd.service",),
+            )
+
+        self.assertEqual(observation["primaryTelemetrySuccessful"], True)
+        self.assertEqual(observation["cpuUsedPercent"], 96.0)
+        self.assertEqual(observation["normalizedLoad5"], 1.6)
+        self.assertEqual(observation["memoryAvailablePercent"], 9.0)
+        self.assertEqual(
+            observation["filesystems"],
+            [
+                {
+                    "mountpoint": "/",
+                    "freePercent": 9.0,
+                    "freeBytes": float(19 * 1024**3),
+                    "exhaustionWithin24Hours": True,
+                }
+            ],
+        )
+        self.assertEqual(observation["requiredObservationsComplete"], True)
+
+    def test_missing_health_series_are_incomplete_instead_of_zero(
+        self,
+    ) -> None:
+        observed_at = datetime(2026, 7, 27, tzinfo=UTC)
+        with patch(
+            "lab_dashboard.prometheus._instant_sample",
+            side_effect=[
+                (observed_at, 1.0),
+                (observed_at, 25.0),
+                (observed_at, 8.0),
+                (observed_at, 4.0),
+                (observed_at, 50.0),
+                None,
+                None,
+                None,
+            ],
+        ):
+            observation = current_health_observation(
+                "http://127.0.0.1:9090", "server-1", ("/",)
+            )
+
+        self.assertEqual(observation["requiredObservationsComplete"], False)
+        filesystem = observation["filesystems"][0]
+        self.assertIsNone(filesystem["freePercent"])
+        self.assertIsNone(filesystem["freeBytes"])
+        self.assertIsNone(filesystem["exhaustionWithin24Hours"])
+
+    def test_missing_profile_required_series_makes_observation_incomplete(
+        self,
+    ) -> None:
+        observed_at = datetime(2026, 7, 27, tzinfo=UTC)
+        with patch(
+            "lab_dashboard.prometheus._instant_sample",
+            side_effect=[
+                (observed_at, 1.0),
+                (observed_at, 25.0),
+                (observed_at, 8.0),
+                (observed_at, 4.0),
+                (observed_at, 50.0),
+                (observed_at, 750 * 1024**3),
+                (observed_at, 75.0),
+                (observed_at, 0.0),
+                None,
+            ],
+        ):
+            observation = current_health_observation(
+                "http://127.0.0.1:9090",
+                "server-1",
+                ("/",),
+                required_observations=("temperature-headroom",),
+            )
+
+        self.assertEqual(observation["requiredObservationsComplete"], False)
+
     def test_generated_jobs_preserve_per_server_mtls_and_thirty_second_scrape(
         self,
     ) -> None:

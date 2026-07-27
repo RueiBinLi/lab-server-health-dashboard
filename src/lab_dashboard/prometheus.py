@@ -15,6 +15,10 @@ from lab_dashboard.database import (
     ObservationTarget,
     list_active_observation_targets,
 )
+from lab_dashboard.health import (
+    FilesystemHealthObservation,
+    HealthObservation,
+)
 
 
 SCRAPE_INTERVAL_SECONDS = 30
@@ -60,6 +64,205 @@ class PrometheusUnavailable(Exception):
 
 class InvalidHistoryQuery(Exception):
     pass
+
+
+def current_health_observation(
+    prometheus_url: str,
+    server_id: str,
+    mountpoints: tuple[str, ...],
+    *,
+    required_observations: tuple[str, ...] = (),
+    required_services: tuple[str, ...] = (),
+) -> HealthObservation:
+    primary_sample = _instant_sample(
+        prometheus_url, f'up{{server_id="{server_id}"}}'
+    )
+    primary_successful = (
+        primary_sample is not None and primary_sample[1] == 1.0
+    )
+    cpu = _instant_value(prometheus_url, _cpu_expression(server_id))
+    logical_cpus = _instant_value(
+        prometheus_url,
+        (
+            "count(node_cpu_seconds_total"
+            f'{{server_id="{server_id}",mode="idle"}})'
+        ),
+    )
+    load5 = _instant_value(
+        prometheus_url, f'node_load5{{server_id="{server_id}"}}'
+    )
+    normalized_load = (
+        None
+        if load5 is None or logical_cpus is None or logical_cpus <= 0
+        else load5 / logical_cpus
+    )
+    memory_available_percent = _instant_value(
+        prometheus_url,
+        (
+            "100 * node_memory_MemAvailable_bytes"
+            f'{{server_id="{server_id}"}} / node_memory_MemTotal_bytes'
+            f'{{server_id="{server_id}"}}'
+        ),
+    )
+    filesystems: list[FilesystemHealthObservation] = []
+    for mountpoint in mountpoints:
+        selector = (
+            f'server_id="{server_id}",mountpoint="{_label(mountpoint)}",'
+            'fstype!~"tmpfs|overlay|squashfs"'
+        )
+        free_bytes = _instant_value(
+            prometheus_url,
+            f"max(node_filesystem_avail_bytes{{{selector}}})",
+        )
+        free_percent = _instant_value(
+            prometheus_url,
+            (
+                "100 * max(node_filesystem_avail_bytes"
+                f"{{{selector}}} / node_filesystem_size_bytes{{{selector}}})"
+            ),
+        )
+        predicted_exhaustion = _instant_value(
+            prometheus_url,
+            (
+                "max(predict_linear(node_filesystem_avail_bytes"
+                f"{{{selector}}}[6h], 86400) < bool 0)"
+            ),
+        )
+        filesystems.append(
+            {
+                "mountpoint": mountpoint,
+                "freePercent": _rounded(free_percent),
+                "freeBytes": _rounded(free_bytes),
+                "exhaustionWithin24Hours": (
+                    None
+                    if predicted_exhaustion is None
+                    else predicted_exhaustion == 1.0
+                ),
+            }
+        )
+    required_complete = (
+        primary_successful
+        and cpu is not None
+        and normalized_load is not None
+        and memory_available_percent is not None
+        and all(
+            filesystem["freePercent"] is not None
+            and filesystem["freeBytes"] is not None
+            and filesystem["exhaustionWithin24Hours"] is not None
+            for filesystem in filesystems
+        )
+        and all(
+            _required_observation_present(
+                prometheus_url,
+                server_id=server_id,
+                observation=required,
+                primary_successful=primary_successful,
+                cpu_complete=cpu is not None and normalized_load is not None,
+                memory_complete=memory_available_percent is not None,
+                filesystems=filesystems,
+            )
+            for required in required_observations
+        )
+        and all(
+            _series_present(
+                prometheus_url,
+                (
+                    "node_systemd_unit_state"
+                    f'{{server_id="{server_id}",name="{_label(service)}"}}'
+                ),
+            )
+            for service in required_services
+        )
+    )
+    return {
+        "primaryTelemetrySuccessful": primary_successful,
+        "requiredObservationsComplete": required_complete,
+        "cpuUsedPercent": _rounded(cpu),
+        "normalizedLoad5": _rounded(normalized_load),
+        "memoryAvailablePercent": _rounded(memory_available_percent),
+        "filesystems": filesystems,
+    }
+
+
+def _required_observation_present(
+    prometheus_url: str,
+    *,
+    server_id: str,
+    observation: str,
+    primary_successful: bool,
+    cpu_complete: bool,
+    memory_complete: bool,
+    filesystems: list[FilesystemHealthObservation],
+) -> bool:
+    directly_observed = {
+        "reachability": primary_successful,
+        "cpu": cpu_complete,
+        "memory": memory_complete,
+        "root-filesystem": any(
+            filesystem["mountpoint"] == "/"
+            and filesystem["freePercent"] is not None
+            and filesystem["freeBytes"] is not None
+            for filesystem in filesystems
+        ),
+    }
+    if observation in directly_observed:
+        return directly_observed[observation]
+    metric_groups = {
+        "temperature-headroom": (
+            '{__name__=~"node_hwmon_temp_celsius|'
+            f'node_thermal_zone_temp",server_id="{server_id}"}}',
+        ),
+        "critical-errors": (
+            f'lab_critical_errors_total{{server_id="{server_id}"}}',
+        ),
+        "gpu-utilization": (
+            f'lab_gpu_utilization_ratio{{server_id="{server_id}"}}',
+        ),
+        "gpu-vram": (
+            f'lab_gpu_vram_used_bytes{{server_id="{server_id}"}}',
+            f'lab_gpu_vram_total_bytes{{server_id="{server_id}"}}',
+        ),
+        "gpu-temperature": (
+            f'lab_gpu_temperature_celsius{{server_id="{server_id}"}}',
+        ),
+        "gpu-faults": (
+            f'lab_gpu_faults_total{{server_id="{server_id}"}}',
+        ),
+    }
+    expressions = metric_groups.get(observation)
+    return (
+        expressions is not None
+        and all(
+            _series_present(prometheus_url, expression)
+            for expression in expressions
+        )
+    )
+
+
+def _series_present(prometheus_url: str, expression: str) -> bool:
+    count = _instant_value(prometheus_url, f"count({expression})")
+    return count is not None and count > 0
+
+
+def unavailable_health_observation(
+    mountpoints: tuple[str, ...],
+) -> HealthObservation:
+    return {
+        "primaryTelemetrySuccessful": False,
+        "requiredObservationsComplete": None,
+        "cpuUsedPercent": None,
+        "normalizedLoad5": None,
+        "memoryAvailablePercent": None,
+        "filesystems": [
+            {
+                "mountpoint": mountpoint,
+                "freePercent": None,
+                "freeBytes": None,
+                "exhaustionWithin24Hours": None,
+            }
+            for mountpoint in mountpoints
+        ],
+    }
 
 
 def current_resource_usage(

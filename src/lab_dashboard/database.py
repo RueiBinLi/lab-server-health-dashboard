@@ -124,6 +124,38 @@ class RegisteredServer:
     last_observation_result: str | None
 
 
+def profile_persistent_mountpoints(
+    server: RegisteredServer,
+) -> tuple[str, ...]:
+    mounts = server.profile.definition.get("persistentMounts", ["/"])
+    mount_values = mounts if isinstance(mounts, list) else ["/"]
+    return tuple(mount for mount in mount_values if isinstance(mount, str))
+
+
+def profile_required_observations(
+    server: RegisteredServer,
+) -> tuple[str, ...]:
+    observations = server.profile.definition.get("requiredObservations", [])
+    observation_values = (
+        observations if isinstance(observations, list) else []
+    )
+    return tuple(
+        observation
+        for observation in observation_values
+        if isinstance(observation, str)
+    )
+
+
+def profile_required_services(
+    server: RegisteredServer,
+) -> tuple[str, ...]:
+    services = server.profile.definition.get("requiredServices", [])
+    service_values = services if isinstance(services, list) else []
+    return tuple(
+        service for service in service_values if isinstance(service, str)
+    )
+
+
 class DisplayNameConflict(Exception):
     pass
 

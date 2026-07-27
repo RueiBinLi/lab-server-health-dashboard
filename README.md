@@ -68,6 +68,14 @@ Tailscale Serve. The dashboard offers only server-scoped CPU, system-memory,
 and disk history queries to authorized viewers, rather than raw Prometheus or
 unrestricted PromQL access.
 
+Verified servers are classified as Healthy, Degraded, or Unavailable from
+primary telemetry, required observation completeness, paired CPU pressure,
+available system memory, and persistent-filesystem capacity and exhaustion
+forecasting. Server Incidents retain cause and severity changes for each
+continuous non-Healthy period in SQLite, including across central service
+restarts. Lab Users receive explicit safe explanations; Lab Administrators
+also receive active causes and incident timing.
+
 Resource Usage reports CPU as percent used, memory and persistent filesystems
 as used/total GiB plus percent, and the age of the newest scrape. Missing series
 are displayed as missing instead of zero. Lab Administrators additionally see

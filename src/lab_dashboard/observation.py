@@ -10,11 +10,18 @@ from pathlib import Path
 from lab_dashboard.database import (
     ObservationTarget,
     list_active_observation_targets,
+    list_registered_servers,
+    profile_persistent_mountpoints,
+    profile_required_observations,
+    profile_required_services,
     record_observation_run,
 )
+from lab_dashboard.health import evaluate_server_health, health_now
 from lab_dashboard.prometheus import (
     PrometheusUnavailable,
+    current_health_observation,
     reconcile_prometheus,
+    unavailable_health_observation,
 )
 
 
@@ -77,6 +84,7 @@ class ObservationEngine:
             except PrometheusUnavailable:
                 pass
             self._observe_active_targets()
+            self._evaluate_active_health()
             self._wake.wait(timeout=30)
             self._wake.clear()
 
@@ -100,6 +108,30 @@ class ObservationEngine:
                 self._database_path,
                 server_id=target.server_id,
                 result=result,
+            )
+
+    def _evaluate_active_health(self) -> None:
+        for server in list_registered_servers(self._database_path):
+            if server.enrollment_state != "active":
+                continue
+            mountpoints = profile_persistent_mountpoints(server)
+            try:
+                observation = current_health_observation(
+                    self._prometheus_url,
+                    server.server_id,
+                    mountpoints,
+                    required_observations=profile_required_observations(
+                        server
+                    ),
+                    required_services=profile_required_services(server),
+                )
+            except PrometheusUnavailable:
+                observation = unavailable_health_observation(mountpoints)
+            evaluate_server_health(
+                self._database_path,
+                server_id=server.server_id,
+                observation=observation,
+                now=health_now(),
             )
 
 
