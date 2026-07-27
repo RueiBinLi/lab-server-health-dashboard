@@ -57,8 +57,6 @@ NVIDIA_GPU_DEFINITION = {
         "critical-errors",
         "gpu-utilization",
         "gpu-vram",
-        "gpu-temperature",
-        "gpu-faults",
     ],
     "persistentMounts": ["/"],
     "requiredServices": [],
@@ -199,6 +197,18 @@ def profile_temperature_sensors(
         for sensor in sensor_values
         if isinstance(sensor, dict)
         and isinstance(sensor.get("logicalName"), str)
+    )
+
+
+def profile_expected_gpu_count(server: RegisteredServer) -> int | None:
+    capabilities = cast(
+        dict[str, object], server.profile.definition.get("capabilities", {})
+    )
+    count = capabilities.get("expectedDeviceCount")
+    return (
+        count
+        if capabilities.get("gpu") is True and isinstance(count, int)
+        else None
     )
 
 
@@ -888,6 +898,7 @@ def publish_profile(
                     actor = excluded.actor,
                     reason = excluded.reason,
                     operation = excluded.operation
+                WHERE staged_profile_configurations.operation = 'publication'
                 """,
                 (
                     server_id,
@@ -1432,17 +1443,6 @@ def profile_revision_at(
             """,
             (server_id, normalized.isoformat()),
         ).fetchone()
-        if row is None:
-            row = connection.execute(
-                """
-                SELECT profile_id, profile_revision
-                FROM server_profile_activations
-                WHERE server_id = ?
-                ORDER BY activated_at, activation_id
-                LIMIT 1
-                """,
-                (server_id,),
-            ).fetchone()
     if row is None:
         return None
     return cast(str, row["profile_id"]), cast(int, row["profile_revision"])

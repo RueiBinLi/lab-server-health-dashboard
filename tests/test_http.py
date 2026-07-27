@@ -763,8 +763,6 @@ class CollectorBootstrapTests(unittest.TestCase):
             [
                 {"observation": "gpu-utilization", "present": False},
                 {"observation": "gpu-vram", "present": False},
-                {"observation": "gpu-temperature", "present": False},
-                {"observation": "gpu-faults", "present": False},
             ],
         )
         self.assertFalse(review["readyForApproval"])
@@ -931,7 +929,7 @@ class CollectorBootstrapTests(unittest.TestCase):
         )
         self.assertEqual(issued["expiresInSeconds"], 900)
         installer = issued["installer"]
-        self.assertEqual(installer["version"], "1.2.0")
+        self.assertEqual(installer["version"], "1.3.0")
         self.assertFalse(installer["requiresNvidia"])
         self.assertEqual(
             installer["signingKeySha256"],

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 from test_http import RunningDashboard
@@ -31,6 +31,22 @@ def complete_observation() -> dict[str, object]:
             }
         ],
     }
+
+
+def complete_gpu_observation() -> dict[str, object]:
+    observation = complete_observation()
+    observation["gpus"] = [
+        {
+            "gpuUuid": "GPU-5ee4",
+            "headroomCelsius": 20.0,
+            "thermalThrottling": False,
+            "xidEvent": False,
+            "resetEvent": False,
+            "volatileUncorrectableEccEvent": False,
+            "aggregateUncorrectableEcc": 0.0,
+        }
+    ]
+    return observation
 
 
 class ServerHealthHttpTests(unittest.TestCase):
@@ -238,6 +254,45 @@ class ServerHealthHttpTests(unittest.TestCase):
             "required-observations",
         )
         self.assertEqual(recovered[0], "Healthy")
+
+    def test_gpu_events_use_discrete_and_persistent_lifecycles(self) -> None:
+        now = [datetime(2026, 7, 27, 2, 20, tzinfo=UTC)]
+        observation = complete_gpu_observation()
+        gpu = cast(list[dict[str, object]], observation["gpus"])[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            with RunningDashboard() as dashboard:
+                activate_server(dashboard, Path(temporary))
+                self._run_health_requests(dashboard, observation, now)
+                gpu["xidEvent"] = True
+                xid = self._run_health_requests(dashboard, observation, now)
+                gpu["xidEvent"] = False
+                self._run_health_requests(dashboard, observation, now)
+                now[0] += timedelta(minutes=5)
+                xid_cleared = self._run_health_requests(
+                    dashboard, observation, now
+                )
+                gpu["aggregateUncorrectableEcc"] = 1.0
+                aggregate = self._run_health_requests(
+                    dashboard, observation, now
+                )
+                gpu["aggregateUncorrectableEcc"] = 0.0
+                now[0] += timedelta(hours=1)
+                aggregate_persists = self._run_health_requests(
+                    dashboard, observation, now
+                )
+
+        self.assertEqual(xid[0], "Degraded")
+        self.assertEqual(
+            xid[1]["activeHealthCauses"][0]["rule"],
+            "gpu-xid:GPU-5ee4",
+        )
+        self.assertEqual(xid_cleared[0], "Healthy")
+        self.assertEqual(aggregate[0], "Degraded")
+        self.assertEqual(aggregate_persists[0], "Degraded")
+        self.assertEqual(
+            aggregate_persists[1]["activeHealthCauses"][0]["rule"],
+            "gpu-ecc-aggregate:GPU-5ee4",
+        )
 
     def test_central_observation_loss_starts_primary_telemetry_timer(
         self,

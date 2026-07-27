@@ -30,6 +30,16 @@ class TemperatureHealthObservation(TypedDict):
     throttling: bool | None
 
 
+class GpuHealthObservation(TypedDict):
+    gpuUuid: str
+    headroomCelsius: float | None
+    thermalThrottling: bool | None
+    xidEvent: bool | None
+    resetEvent: bool | None
+    volatileUncorrectableEccEvent: bool | None
+    aggregateUncorrectableEcc: float | None
+
+
 class HealthObservation(TypedDict):
     primaryTelemetrySuccessful: bool | None
     requiredObservationsComplete: bool | None
@@ -39,6 +49,7 @@ class HealthObservation(TypedDict):
     filesystems: list[FilesystemHealthObservation]
     requiredServices: NotRequired[list[RequiredServiceHealthObservation]]
     temperatures: NotRequired[list[TemperatureHealthObservation]]
+    gpus: NotRequired[list[GpuHealthObservation]]
     inventoryMatchesProfile: NotRequired[bool | None]
 
 
@@ -450,6 +461,50 @@ def _rule_conditions(
             firing_seconds=5 * 60,
             clearing_seconds=10 * 60,
         )
+    for gpu in observation.get("gpus", []):
+        gpu_uuid = gpu.get("gpuUuid")
+        if not isinstance(gpu_uuid, str):
+            continue
+        headroom = _number(gpu.get("headroomCelsius"))
+        throttling = gpu.get("thermalThrottling")
+        conditions[f"gpu-temperature:{gpu_uuid}"] = _RuleCondition(
+            firing=(
+                None
+                if headroom is None or not isinstance(throttling, bool)
+                else headroom <= temperature_fire or throttling
+            ),
+            clearing=(
+                None
+                if headroom is None or not isinstance(throttling, bool)
+                else headroom > temperature_clear and not throttling
+            ),
+            firing_seconds=5 * 60,
+            clearing_seconds=10 * 60,
+        )
+        discrete_events = (
+            ("gpu-xid", gpu.get("xidEvent")),
+            ("gpu-reset", gpu.get("resetEvent")),
+            (
+                "gpu-ecc-volatile",
+                gpu.get("volatileUncorrectableEccEvent"),
+            ),
+        )
+        for prefix, event in discrete_events:
+            conditions[f"{prefix}:{gpu_uuid}"] = _RuleCondition(
+                firing=event if isinstance(event, bool) else None,
+                clearing=not event if isinstance(event, bool) else None,
+                firing_seconds=0,
+                clearing_seconds=5 * 60,
+            )
+        aggregate_ecc = _number(gpu.get("aggregateUncorrectableEcc"))
+        conditions[f"gpu-ecc-aggregate:{gpu_uuid}"] = _RuleCondition(
+            firing=None if aggregate_ecc is None else aggregate_ecc > 0,
+            # Aggregate DBE is a persistent Critical Error. A zero after it
+            # fired can be a collector or driver counter reset, not recovery.
+            clearing=None if aggregate_ecc is None else False,
+            firing_seconds=0,
+            clearing_seconds=0,
+        )
     return conditions
 
 
@@ -707,6 +762,16 @@ def _summary(rule: str) -> str:
             f"Temperature sensor {rule.split(':', 1)[1]} "
             "has insufficient hardware-relative headroom."
         )
+    gpu_summaries = {
+        "gpu-temperature": "has insufficient slowdown-temperature headroom.",
+        "gpu-xid": "reported an NVIDIA XID Critical Error.",
+        "gpu-reset": "reported a definitive reset Critical Error.",
+        "gpu-ecc-volatile": "reported volatile uncorrectable ECC.",
+        "gpu-ecc-aggregate": "has aggregate uncorrectable ECC.",
+    }
+    prefix, _, gpu_uuid = rule.partition(":")
+    if prefix in gpu_summaries and gpu_uuid:
+        return f"GPU {gpu_uuid} {gpu_summaries[prefix]}"
     return _SUMMARIES[rule]
 
 

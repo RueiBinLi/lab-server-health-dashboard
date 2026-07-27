@@ -1,0 +1,10 @@
+# TYPE DCGM_FI_DEV_GPU_UTIL gauge
+DCGM_FI_DEV_GPU_UTIL{gpu="0",gpu_uuid="GPU-a",pci_bus_id="00000000:01:00.0",modelName="NVIDIA A100"} 95
+DCGM_FI_DEV_GPU_UTIL{gpu="1",gpu_uuid="GPU-b",pci_bus_id="00000000:02:00.0",modelName="NVIDIA A100"} 40
+# TYPE DCGM_FI_DEV_FB_USED gauge
+DCGM_FI_DEV_FB_USED{gpu="0",gpu_uuid="GPU-a"} 39000
+DCGM_FI_DEV_FB_USED{gpu="1",gpu_uuid="GPU-b"} 10000
+# TYPE DCGM_FI_DEV_FB_FREE gauge
+DCGM_FI_DEV_FB_FREE{gpu="0",gpu_uuid="GPU-a"} 1000
+DCGM_FI_DEV_FB_FREE{gpu="1",gpu_uuid="GPU-b"} 30000
+# Optional FB_RESERVED, SLOWDOWN_TEMP, and XID fields are unavailable.

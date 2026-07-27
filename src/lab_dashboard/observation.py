@@ -15,6 +15,7 @@ from lab_dashboard.database import (
     profile_required_observations,
     profile_required_services,
     profile_temperature_sensors,
+    profile_expected_gpu_count,
     profile_threshold_overrides,
     record_observation_run,
 )
@@ -39,13 +40,13 @@ OBSERVATION_METRICS = {
         {"node_hwmon_temp_celsius", "node_thermal_zone_temp"},
     ),
     "critical-errors": ({"lab_critical_errors_total"},),
-    "gpu-utilization": ({"lab_gpu_utilization_ratio"},),
+    "gpu-utilization": ({"DCGM_FI_DEV_GPU_UTIL"},),
     "gpu-vram": (
-        {"lab_gpu_vram_used_bytes"},
-        {"lab_gpu_vram_total_bytes"},
+        {"DCGM_FI_DEV_FB_USED"},
+        {"DCGM_FI_DEV_FB_FREE"},
     ),
-    "gpu-temperature": ({"lab_gpu_temperature_celsius"},),
-    "gpu-faults": ({"lab_gpu_faults_total"},),
+    "gpu-temperature": ({"DCGM_FI_DEV_GPU_TEMP"},),
+    "gpu-faults": ({"DCGM_FI_DEV_XID_ERRORS"},),
 }
 
 
@@ -127,6 +128,7 @@ class ObservationEngine:
                     ),
                     required_services=profile_required_services(server),
                     temperature_sensors=profile_temperature_sensors(server),
+                    expected_gpu_count=profile_expected_gpu_count(server),
                 )
             except PrometheusUnavailable:
                 observation = unavailable_health_observation(mountpoints)

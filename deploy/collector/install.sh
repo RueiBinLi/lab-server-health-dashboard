@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALLER_VERSION=1.2.0
+INSTALLER_VERSION=1.3.0
 NODE_EXPORTER_VERSION=1.11.1
+DCGM_EXPORTER_VERSION=4.4.1-4.7.0
 NODE_EXPORTER_AMD64_SHA256=9f5ea48e5bc7b656f8a91a32e7d7deb89f70f73dabd0d974418aca15f37d6810
 NODE_EXPORTER_ARM64_SHA256=ba1886efbd76cb96b0087c695ea8d1b9cb6e8aa946c996d744e9ee16c8e3591a
 
@@ -79,12 +80,30 @@ if [[ $requires_nvidia == 1 ]]; then
     || fail "nvidia-smi is required by this Server Profile"
   nvidia-smi --query-gpu=uuid --format=csv,noheader >/dev/null \
     || fail "the NVIDIA driver cannot enumerate GPUs"
+  DCGM_EXPORTER_BIN=$(command -v dcgm-exporter) \
+    || fail "dcgm-exporter ${DCGM_EXPORTER_VERSION} is required by this Server Profile"
+  "$DCGM_EXPORTER_BIN" --version 2>&1 | grep -F "$DCGM_EXPORTER_VERSION" >/dev/null \
+    || fail "dcgm-exporter must match the pinned compatible version"
 fi
 
 id lab-node-exporter >/dev/null 2>&1 \
   || useradd --system --no-create-home --shell /usr/sbin/nologin lab-node-exporter
 install -d -m 0700 -o root -g root /etc/lab-collector/private
 install -d -m 0755 -o root -g root /etc/lab-collector
+cat >/etc/lab-collector/dcgm-counters.csv <<'DCGM_COUNTERS'
+# Pinned contract for dcgm-exporter 4.4.1 with DCGM 4.7.
+DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization (percent).
+DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (MiB).
+DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (MiB).
+DCGM_FI_DEV_FB_RESERVED, gauge, Framebuffer memory reserved (MiB).
+DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature (C).
+DCGM_FI_DEV_SLOWDOWN_TEMP, gauge, GPU slowdown temperature limit (C).
+DCGM_FI_DEV_THERMAL_VIOLATION, counter, Thermal violation duration.
+DCGM_EXP_XID_ERRORS_TOTAL, counter, Durable observed NVIDIA XID errors.
+DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Volatile uncorrectable ECC errors.
+DCGM_FI_DEV_ECC_DBE_AGG_TOTAL, counter, Aggregate uncorrectable ECC errors.
+DCGM_COUNTERS
+chmod 0644 /etc/lab-collector/dcgm-counters.csv
 
 temporary_directory=$(mktemp -d)
 trap 'rm -rf "$temporary_directory"; unset bootstrap_token' EXIT
@@ -252,37 +271,48 @@ critical_errors=$(
     | wc -l || true
 )
 printf 'lab_critical_errors_total %d\n' "$critical_errors" >"$temporary"
-
-if command -v nvidia-smi >/dev/null; then
-  gpu_faults=$(
-    journalctl --boot --dmesg --quiet --no-pager 2>/dev/null \
-      | grep -c 'NVRM: Xid' || true
-  )
-  nvidia-smi \
-    --query-gpu=uuid,utilization.gpu,memory.used,memory.total,temperature.gpu \
-    --format=csv,noheader,nounits \
-    | while IFS=, read -r uuid utilization memory_used memory_total temperature
-      do
-        uuid=${uuid// /}
-        utilization=${utilization// /}
-        printf 'lab_gpu_utilization_ratio{gpu="%s"} %s\n' \
-          "$uuid" "$(awk -v value="$utilization" \
-            'BEGIN { printf "%.4f", value / 100 }')"
-        printf 'lab_gpu_vram_used_bytes{gpu="%s"} %d\n' \
-          "$uuid" "$(( ${memory_used// /} * 1024 * 1024 ))"
-        printf 'lab_gpu_vram_total_bytes{gpu="%s"} %d\n' \
-          "$uuid" "$(( ${memory_total// /} * 1024 * 1024 ))"
-        printf 'lab_gpu_temperature_celsius{gpu="%s"} %s\n' \
-          "$uuid" "${temperature// /}"
-        printf 'lab_gpu_faults_total{gpu="%s"} %d\n' \
-          "$uuid" "$gpu_faults"
-      done >>"$temporary"
+# Reset evidence is supplied only by a platform-specific definitive source.
+# The default collector deliberately emits no inferred reset metric from XIDs
+# or temporary device disappearance.
+: "${LAB_GPU_RESET_METRICS_FILE:=/var/lib/lab-collector/gpu-resets.prom}"
+if [[ -r "$LAB_GPU_RESET_METRICS_FILE" ]]; then
+  grep '^lab_health_gpu_resets_total{' "$LAB_GPU_RESET_METRICS_FILE" \
+    >>"$temporary" || true
 fi
+
+dcgm_temporary="$directory/dcgm.prom.$$"
+if curl --fail --silent --max-time 5 http://127.0.0.1:9400/metrics \
+  | awk '/^# (HELP|TYPE) DCGM_|^DCGM_/' >"$dcgm_temporary"; then
+  chmod 0644 "$dcgm_temporary"
+  mv "$dcgm_temporary" "$directory/dcgm.prom"
+else
+  rm -f "$dcgm_temporary"
+fi
+
 chmod 0644 "$temporary"
 mv "$temporary" "$directory/enrollment.prom"
 TEXTFILE_COLLECTOR
 chmod 0755 /usr/local/bin/lab-collector-textfile
 /usr/local/bin/lab-collector-textfile
+
+if [[ $requires_nvidia == 1 ]]; then
+  cat >/etc/systemd/system/lab-dcgm-exporter.service <<UNIT
+[Unit]
+Description=Lab NVIDIA DCGM exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$DCGM_EXPORTER_BIN -a 127.0.0.1:9400 -c /etc/lab-collector/dcgm-counters.csv
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+fi
 
 cat >/etc/lab-collector/web-config.yml <<'WEB_CONFIG'
 tls_server_config:
@@ -342,5 +372,8 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now lab-node-exporter.service
+if [[ $requires_nvidia == 1 ]]; then
+  systemctl enable --now lab-dcgm-exporter.service
+fi
 systemctl enable --now lab-collector-textfile.timer
 echo "collector bootstrap complete; server is Pending Verification"

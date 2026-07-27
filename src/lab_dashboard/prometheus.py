@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 from lab_dashboard.database import (
     ObservationTarget,
@@ -20,13 +20,14 @@ from lab_dashboard.health import (
     HealthObservation,
     RequiredServiceHealthObservation,
     TemperatureHealthObservation,
+    GpuHealthObservation,
 )
 
 
 SCRAPE_INTERVAL_SECONDS = 30
 FRESH_AFTER_SECONDS = 3 * SCRAPE_INTERVAL_SECONDS
 MAX_HISTORY = timedelta(days=30)
-HISTORY_METRICS = {"cpu", "system-memory", "disk"}
+HISTORY_METRICS = {"cpu", "system-memory", "disk", "gpu-utilization", "gpu-vram"}
 
 
 class PercentageUsage(TypedDict):
@@ -52,12 +53,25 @@ class CollectorSuccess(TypedDict):
     success: bool | None
 
 
+class GpuUsage(TypedDict):
+    utilizationPercent: float | None
+    vramUsedBytes: float | None
+    vramFreeBytes: float | None
+    vramReservedBytes: float | None
+    vramTotalBytes: float | None
+    vramUsedPercent: float | None
+    lowVramHeadroom: bool | None
+    temperatureCelsius: float | None
+    slowdownLimitCelsius: float | None
+
+
 class ResourceUsage(TypedDict):
     cpu: PercentageUsage
     systemMemory: CapacityUsage
     filesystems: list[FilesystemUsage]
     freshness: Freshness
     collector: CollectorSuccess
+    gpu: NotRequired[GpuUsage]
 
 
 class PrometheusUnavailable(Exception):
@@ -76,6 +90,7 @@ def current_health_observation(
     required_observations: tuple[str, ...] = (),
     required_services: tuple[str, ...] = (),
     temperature_sensors: tuple[str, ...] = (),
+    expected_gpu_count: int | None = None,
 ) -> HealthObservation:
     primary_sample = _instant_sample(
         prometheus_url, f'up{{server_id="{server_id}"}}'
@@ -182,6 +197,57 @@ def current_health_observation(
                 ),
             }
         )
+    gpu_observations: list[GpuHealthObservation] = []
+    gpu_uuids = (
+        _instant_label_values(
+            prometheus_url,
+            f'DCGM_FI_DEV_GPU_UTIL{{server_id="{server_id}"}}',
+            "gpu_uuid",
+        )
+        if expected_gpu_count is not None
+        else []
+    )
+    for gpu_uuid in gpu_uuids:
+        selector = (
+            f'server_id="{server_id}",gpu_uuid="{_label(gpu_uuid)}"'
+        )
+        temperature = _instant_value(
+            prometheus_url, f"DCGM_FI_DEV_GPU_TEMP{{{selector}}}"
+        )
+        slowdown = _instant_value(
+            prometheus_url, f"DCGM_FI_DEV_SLOWDOWN_TEMP{{{selector}}}"
+        )
+        thermal = _instant_value(
+            prometheus_url,
+            f"increase(DCGM_FI_DEV_THERMAL_VIOLATION{{{selector}}}[10m])",
+        )
+        gpu_observations.append(
+            {
+                "gpuUuid": gpu_uuid,
+                "headroomCelsius": (
+                    None
+                    if temperature is None or slowdown is None
+                    else slowdown - temperature
+                ),
+                "thermalThrottling": None if thermal is None else thermal > 0,
+                "xidEvent": _event_increased(
+                    prometheus_url,
+                    f"DCGM_EXP_XID_ERRORS_TOTAL{{{selector}}}",
+                ),
+                "resetEvent": _event_increased(
+                    prometheus_url,
+                    f"lab_health_gpu_resets_total{{{selector}}}",
+                ),
+                "volatileUncorrectableEccEvent": _event_increased(
+                    prometheus_url,
+                    f"DCGM_FI_DEV_ECC_DBE_VOL_TOTAL{{{selector}}}",
+                ),
+                "aggregateUncorrectableEcc": _instant_value(
+                    prometheus_url,
+                    f"DCGM_FI_DEV_ECC_DBE_AGG_TOTAL{{{selector}}}",
+                ),
+            }
+        )
     required_complete = (
         primary_successful
         and cpu is not None
@@ -214,6 +280,10 @@ def current_health_observation(
             and temperature["throttling"] is not None
             for temperature in temperature_observations
         )
+        and (
+            expected_gpu_count is None
+            or len(gpu_observations) == expected_gpu_count
+        )
     )
     return {
         "primaryTelemetrySuccessful": primary_successful,
@@ -224,7 +294,13 @@ def current_health_observation(
         "filesystems": filesystems,
         "requiredServices": service_observations,
         "temperatures": temperature_observations,
+        "gpus": gpu_observations,
     }
+
+
+def _event_increased(prometheus_url: str, expression: str) -> bool | None:
+    value = _instant_value(prometheus_url, f"increase({expression}[5m])")
+    return None if value is None else value > 0
 
 
 def _required_observation_present(
@@ -259,17 +335,17 @@ def _required_observation_present(
             f'lab_critical_errors_total{{server_id="{server_id}"}}',
         ),
         "gpu-utilization": (
-            f'lab_gpu_utilization_ratio{{server_id="{server_id}"}}',
+            f'DCGM_FI_DEV_GPU_UTIL{{server_id="{server_id}"}}',
         ),
         "gpu-vram": (
-            f'lab_gpu_vram_used_bytes{{server_id="{server_id}"}}',
-            f'lab_gpu_vram_total_bytes{{server_id="{server_id}"}}',
+            f'DCGM_FI_DEV_FB_USED{{server_id="{server_id}"}}',
+            f'DCGM_FI_DEV_FB_FREE{{server_id="{server_id}"}}',
         ),
         "gpu-temperature": (
-            f'lab_gpu_temperature_celsius{{server_id="{server_id}"}}',
+            f'DCGM_FI_DEV_GPU_TEMP{{server_id="{server_id}"}}',
         ),
         "gpu-faults": (
-            f'lab_gpu_faults_total{{server_id="{server_id}"}}',
+            f'DCGM_FI_DEV_XID_ERRORS{{server_id="{server_id}"}}',
         ),
     }
     expressions = metric_groups.get(observation)
@@ -312,6 +388,8 @@ def current_resource_usage(
     prometheus_url: str,
     server_id: str,
     mountpoints: tuple[str, ...],
+    *,
+    include_gpu: bool = False,
 ) -> ResourceUsage:
     cpu = _instant_value(prometheus_url, _cpu_expression(server_id))
     memory_total = _instant_value(
@@ -392,7 +470,7 @@ def current_resource_usage(
         }
         collector_success = up_value == 1.0
 
-    return {
+    usage: ResourceUsage = {
         "cpu": {"usedPercent": _rounded(cpu)},
         "systemMemory": {
             "usedBytes": _rounded(memory_used),
@@ -403,6 +481,57 @@ def current_resource_usage(
         "freshness": freshness,
         "collector": {"success": collector_success},
     }
+    if include_gpu:
+        gpu_utilization = _instant_value(
+            prometheus_url,
+            f'max(DCGM_FI_DEV_GPU_UTIL{{server_id="{server_id}"}})',
+        )
+        framebuffer_used = _instant_value(
+            prometheus_url,
+            f'sum(DCGM_FI_DEV_FB_USED{{server_id="{server_id}"}}) * 1048576',
+        )
+        framebuffer_free = _instant_value(
+            prometheus_url,
+            f'sum(DCGM_FI_DEV_FB_FREE{{server_id="{server_id}"}}) * 1048576',
+        )
+        framebuffer_reserved = _instant_value(
+            prometheus_url,
+            (
+                f'sum(DCGM_FI_DEV_FB_RESERVED{{server_id="{server_id}"}})'
+                " * 1048576"
+            ),
+        )
+        framebuffer_total = _sum_known(
+            framebuffer_used, framebuffer_free, framebuffer_reserved
+        )
+        vram_percent = _percent(framebuffer_used, framebuffer_total)
+        usage["gpu"] = {
+            "utilizationPercent": _rounded(gpu_utilization),
+            "vramUsedBytes": _rounded(framebuffer_used),
+            "vramFreeBytes": _rounded(framebuffer_free),
+            "vramReservedBytes": _rounded(framebuffer_reserved),
+            "vramTotalBytes": _rounded(framebuffer_total),
+            "vramUsedPercent": vram_percent,
+            "lowVramHeadroom": (
+                None if vram_percent is None else vram_percent >= 95
+            ),
+            "temperatureCelsius": _rounded(
+                _instant_value(
+                    prometheus_url,
+                    f'max(DCGM_FI_DEV_GPU_TEMP{{server_id="{server_id}"}})',
+                )
+            ),
+            "slowdownLimitCelsius": _rounded(
+                _instant_value(
+                    prometheus_url,
+                    (
+                        "min(DCGM_FI_DEV_SLOWDOWN_TEMP"
+                        f'{{server_id="{server_id}"}})'
+                    ),
+                )
+            ),
+        }
+    return usage
 
 
 def query_metric_history(
@@ -433,6 +562,19 @@ def query_metric_history(
             f'{{server_id="{server_id}"}})'
         ),
         "disk": _disk_expression(server_id, mountpoint),
+        "gpu-utilization": (
+            f'max(DCGM_FI_DEV_GPU_UTIL{{server_id="{server_id}"}})'
+        ),
+        "gpu-vram": (
+            "100 * sum(DCGM_FI_DEV_FB_USED"
+            f'{{server_id="{server_id}"}}) / '
+            "(sum(DCGM_FI_DEV_FB_USED"
+            f'{{server_id="{server_id}"}}) + '
+            "sum(DCGM_FI_DEV_FB_FREE"
+            f'{{server_id="{server_id}"}}) + '
+            "sum(DCGM_FI_DEV_FB_RESERVED"
+            f'{{server_id="{server_id}"}}))'
+        ),
     }
     points = _range_values(
         prometheus_url,
@@ -522,8 +664,10 @@ def reconcile_prometheus(database_path: Path, prometheus_url: str) -> None:
 
 def unavailable_resource_usage(
     mountpoints: tuple[str, ...],
+    *,
+    include_gpu: bool = False,
 ) -> ResourceUsage:
-    return {
+    usage: ResourceUsage = {
         "cpu": {"usedPercent": None},
         "systemMemory": {
             "usedBytes": None,
@@ -546,6 +690,19 @@ def unavailable_resource_usage(
         },
         "collector": {"success": None},
     }
+    if include_gpu:
+        usage["gpu"] = {
+            "utilizationPercent": None,
+            "vramUsedBytes": None,
+            "vramFreeBytes": None,
+            "vramReservedBytes": None,
+            "vramTotalBytes": None,
+            "vramUsedPercent": None,
+            "lowVramHeadroom": None,
+            "temperatureCelsius": None,
+            "slowdownLimitCelsius": None,
+        }
+    return usage
 
 
 def reload_prometheus(prometheus_url: str) -> None:
@@ -576,6 +733,19 @@ def _instant_sample(
         return None
     value = cast(list[object], series[0]["value"])
     return _sample(value)
+
+
+def _instant_label_values(
+    url: str, expression: str, label: str
+) -> list[str]:
+    result = _api(url, "/api/v1/query", {"query": expression})
+    series = cast(list[dict[str, object]], result.get("result", []))
+    values: list[str] = []
+    for item in series:
+        metric = item.get("metric")
+        if isinstance(metric, dict) and isinstance(metric.get(label), str):
+            values.append(cast(str, metric[label]))
+    return sorted(set(values))
 
 
 def _range_values(
@@ -652,6 +822,12 @@ def _difference(
     if total is None or available is None:
         return None
     return max(0.0, total - available)
+
+
+def _sum_known(*values: float | None) -> float | None:
+    if any(value is None for value in values):
+        return None
+    return sum(cast(float, value) for value in values)
 
 
 def _percent(value: float | None, total: float | None) -> float | None:

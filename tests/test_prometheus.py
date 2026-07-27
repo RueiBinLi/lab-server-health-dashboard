@@ -12,12 +12,29 @@ from lab_dashboard.database import ObservationTarget
 from lab_dashboard.prometheus import (
     current_health_observation,
     current_resource_usage,
+    query_metric_history,
     reconcile_prometheus,
     write_scrape_config,
 )
 
 
 class PrometheusIngestionTests(unittest.TestCase):
+    def test_captured_dcgm_contracts_keep_stable_identity_and_optional_gaps(
+        self,
+    ) -> None:
+        fixtures = Path(__file__).parent / "fixtures" / "dcgm"
+        single = (fixtures / "single_gpu.prom").read_text()
+        multiple = (fixtures / "multi_gpu_optional_fields.prom").read_text()
+
+        for contract in (single, multiple):
+            self.assertIn("DCGM_FI_DEV_GPU_UTIL", contract)
+            self.assertIn("DCGM_FI_DEV_FB_USED", contract)
+            self.assertIn("DCGM_FI_DEV_FB_FREE", contract)
+            self.assertIn('gpu_uuid="GPU-', contract)
+            self.assertIn("pci_bus_id=", contract)
+        self.assertNotIn("DCGM_FI_DEV_FB_RESERVED{", multiple)
+        self.assertNotIn("DCGM_FI_DEV_SLOWDOWN_TEMP{", multiple)
+
     def test_health_observation_preserves_required_values_and_disk_forecast(
         self,
     ) -> None:
@@ -219,6 +236,71 @@ class PrometheusIngestionTests(unittest.TestCase):
         self.assertEqual(collector["success"], False)
         self.assertEqual(freshness["state"], "stale")
         self.assertGreaterEqual(cast(float, freshness["ageSeconds"]), 119)
+
+    def test_gpu_resource_usage_aggregates_devices_and_marks_low_headroom(
+        self,
+    ) -> None:
+        observed_at = datetime.now(UTC)
+        with patch(
+            "lab_dashboard.prometheus._instant_sample",
+            side_effect=[
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                (observed_at, 1.0),
+                (observed_at, observed_at.timestamp()),
+                (observed_at, 80.0),
+                (observed_at, 31_000.0),
+                (observed_at, 1_000.0),
+                (observed_at, 200.0),
+                (observed_at, 78.0),
+                (observed_at, 83.0),
+            ],
+        ):
+            usage = current_resource_usage(
+                "http://127.0.0.1:9090",
+                "server-1",
+                ("/",),
+                include_gpu=True,
+            )
+
+        self.assertEqual(
+            usage["gpu"],
+            {
+                "utilizationPercent": 80.0,
+                "vramUsedBytes": 31_000.0,
+                "vramFreeBytes": 1_000.0,
+                "vramReservedBytes": 200.0,
+                "vramTotalBytes": 32_200.0,
+                "vramUsedPercent": 96.273,
+                "lowVramHeadroom": True,
+                "temperatureCelsius": 78.0,
+                "slowdownLimitCelsius": 83.0,
+            },
+        )
+
+    def test_gpu_history_uses_fixed_aggregate_contract(self) -> None:
+        start = datetime(2026, 7, 26, tzinfo=UTC)
+        end = datetime(2026, 7, 27, tzinfo=UTC)
+        with patch(
+            "lab_dashboard.prometheus._range_values",
+            return_value=[(start, 75.0)],
+        ) as query:
+            history = query_metric_history(
+                "http://127.0.0.1:9090",
+                server_id="server-1",
+                metric="gpu-vram",
+                start=start,
+                end=end,
+                step=3600,
+            )
+
+        self.assertEqual(history["metric"], "gpu-vram")
+        self.assertEqual(history["points"][0]["value"], 75.0)
+        self.assertIn("DCGM_FI_DEV_FB_USED", query.call_args.args[1])
 
     def test_reconciliation_retries_reload_even_when_config_is_unchanged(
         self,

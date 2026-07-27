@@ -48,6 +48,7 @@ from lab_dashboard.database import (
     profile_required_services,
     profile_revision_at,
     profile_temperature_sensors,
+    profile_expected_gpu_count,
     profile_threshold_overrides,
     publish_profile,
     record_bootstrap_failure,
@@ -116,6 +117,14 @@ from lab_dashboard.prometheus import (
 
 
 MAX_REQUEST_BODY_BYTES = 16_384
+
+
+def _server_has_gpu(server: RegisteredServer) -> bool:
+    capabilities = server.profile.definition.get("capabilities", {})
+    return (
+        isinstance(capabilities, dict)
+        and capabilities.get("gpu") is True
+    )
 
 
 def _single_parameter(
@@ -1292,6 +1301,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 required_observations=profile_required_observations(server),
                 required_services=profile_required_services(server),
                 temperature_sensors=profile_temperature_sensors(server),
+                expected_gpu_count=profile_expected_gpu_count(server),
             )
         except PrometheusUnavailable:
             observation = unavailable_health_observation(mountpoints)
@@ -1308,14 +1318,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
     def _resource_usage(self, server: RegisteredServer) -> ResourceUsage:
         mountpoints = self._persistent_mountpoints(server)
+        include_gpu = _server_has_gpu(server)
         try:
             return current_resource_usage(
                 self.server.config.prometheus_url,
                 server.server_id,
                 mountpoints,
+                include_gpu=include_gpu,
             )
         except PrometheusUnavailable:
-            return unavailable_resource_usage(mountpoints)
+            return unavailable_resource_usage(
+                mountpoints, include_gpu=include_gpu
+            )
 
     def _persistent_mountpoints(
         self, server: RegisteredServer
@@ -1384,6 +1398,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if (
                 server is None
                 or metric not in HISTORY_METRICS
+                or (
+                    metric.startswith("gpu-")
+                    and not _server_has_gpu(server)
+                )
                 or len(mountpoint) != 1
                 or not isinstance(persistent_mounts, list)
                 or mountpoint[0] not in persistent_mounts
@@ -1734,6 +1752,26 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 memory["usedBytes"], memory["totalBytes"]
             )
             filesystems = usage["filesystems"]
+            gpu = usage.get("gpu")
+            gpu_html = ""
+            if gpu is not None:
+                headroom = (
+                    " · Low VRAM headroom"
+                    if gpu["lowVramHeadroom"] is True
+                    else ""
+                )
+                gpu_html = (
+                    "<div><strong>GPU</strong><br>"
+                    + escape(_format_percent(gpu["utilizationPercent"]))
+                    + " · VRAM "
+                    + escape(
+                        _format_capacity(
+                            gpu["vramUsedBytes"], gpu["vramTotalBytes"]
+                        )
+                    )
+                    + escape(headroom)
+                    + "</div>"
+                )
             disks = "".join(
                 (
                     "<div><strong>Disk "
@@ -1780,6 +1818,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             <option value="cpu">CPU used (%)</option>
             <option value="system-memory">System memory used (%)</option>
             <option value="disk">Persistent filesystem used (%)</option>
+            {(
+                '<option value="gpu-utilization">GPU utilization (%)</option>'
+                '<option value="gpu-vram">GPU VRAM used (%)</option>'
+                if gpu is not None else ''
+            )}
           </select>
         </label>
         <label>Filesystem
@@ -1816,6 +1859,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         <div><strong>System memory</strong><br>{escape(memory_value)}
           · {escape(_format_percent(memory["usedPercent"]))}</div>
         {disks}
+        {gpu_html}
         <div><strong>Data freshness</strong><br>
           {escape(str(freshness["state"]))} ·
           {escape(_format_age(freshness["ageSeconds"]))}</div>

@@ -1,0 +1,8 @@
+# TYPE DCGM_FI_DEV_GPU_UTIL gauge
+DCGM_FI_DEV_GPU_UTIL{gpu="0",gpu_uuid="GPU-5ee4",pci_bus_id="00000000:01:00.0",modelName="NVIDIA RTX 6000 Ada"} 72
+# TYPE DCGM_FI_DEV_FB_USED gauge
+DCGM_FI_DEV_FB_USED{gpu="0",gpu_uuid="GPU-5ee4"} 24576
+# TYPE DCGM_FI_DEV_FB_FREE gauge
+DCGM_FI_DEV_FB_FREE{gpu="0",gpu_uuid="GPU-5ee4"} 24576
+# TYPE DCGM_FI_DEV_GPU_TEMP gauge
+DCGM_FI_DEV_GPU_TEMP{gpu="0",gpu_uuid="GPU-5ee4"} 68

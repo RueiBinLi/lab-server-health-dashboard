@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 PINNED_SIGNING_KEY_SHA256 = (
-    "a1aa38ed95a8a0409642d2d1775d159dc9005a29441def0a86113f6e6de65942"
+    "b35c06b17a2bc13ab14df78d3a58d584446fd5775e5d56d84c17a7965f6f7e4c"
 )
 
 
