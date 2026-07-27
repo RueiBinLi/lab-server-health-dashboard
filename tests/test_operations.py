@@ -7,6 +7,9 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from lab_dashboard.operations import OperationsError, create_backup
 
 
 class OperationsCliTests(unittest.TestCase):
@@ -30,7 +33,7 @@ class OperationsCliTests(unittest.TestCase):
             secret.chmod(0o640)
 
             result = self.run_operations(
-                "validate", "--secret", str(secret), "--allow-owner", str(os.getuid())
+                "validate", "--secret", str(secret)
             )
 
         self.assertEqual(result.returncode, 1)
@@ -43,15 +46,18 @@ class OperationsCliTests(unittest.TestCase):
             destination = root / "backups"
             (state / "generated").mkdir(parents=True)
             (state / "alertmanager-data").mkdir()
-            (state / "online-intermediate").mkdir()
+            (state / "pki" / "offline-root-ca").mkdir(parents=True)
             (state / "prometheus-data").mkdir()
             (state / "offline-root-ca").mkdir()
             with sqlite3.connect(state / "dashboard.sqlite3") as connection:
                 connection.execute("CREATE TABLE durable (value TEXT)")
                 connection.execute("INSERT INTO durable VALUES ('kept')")
             (state / "generated" / "prometheus.yml").write_text("global: {}")
+            (state / "prometheus.yml").write_text("global: {}")
+            (state / "alertmanager.yml").write_text("route: {}")
             (state / "alertmanager-data" / "nflog").write_text("state")
-            (state / "online-intermediate" / "intermediate.key").write_text("key")
+            (state / "pki" / "collector-ca.key").write_text("key")
+            (state / "pki" / "offline-root-ca" / "root.key").write_text("root")
             (state / "prometheus-data" / "chunks").write_text("history")
             (state / "offline-root-ca" / "root.key").write_text("root")
 
@@ -74,7 +80,7 @@ class OperationsCliTests(unittest.TestCase):
         self.assertIn("dashboard.sqlite3", names)
         self.assertIn("generated/prometheus.yml", names)
         self.assertIn("alertmanager-data/nflog", names)
-        self.assertIn("online-intermediate/intermediate.key", names)
+        self.assertIn("pki/collector-ca.key", names)
         self.assertFalse(any("prometheus-data" in name for name in names))
         self.assertFalse(any("offline-root-ca" in name for name in names))
         self.assertEqual(manifest["metricHistory"], "excluded")
@@ -87,6 +93,10 @@ class OperationsCliTests(unittest.TestCase):
             with sqlite3.connect(state / "dashboard.sqlite3") as connection:
                 connection.execute("CREATE TABLE durable (value TEXT)")
                 connection.execute("INSERT INTO durable VALUES ('restored')")
+            (state / "prometheus.yml").write_text("global: {}")
+            (state / "alertmanager.yml").write_text("route: {}")
+            (state / "alertmanager-data").mkdir()
+            (state / "pki").mkdir()
             backup = self.run_operations(
                 "backup",
                 "--state-directory",
@@ -117,6 +127,44 @@ class OperationsCliTests(unittest.TestCase):
         self.assertEqual(value, ("restored",))
         self.assertEqual(report["metricHistory"], "not-restored")
         self.assertEqual(report["restoreMode"], "isolated")
+
+    def test_failed_encryption_never_leaves_plaintext_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            destination = root / "backups"
+            state.mkdir()
+            with sqlite3.connect(state / "dashboard.sqlite3") as connection:
+                connection.execute("CREATE TABLE durable (value TEXT)")
+            (state / "prometheus.yml").write_text("global: {}")
+            (state / "alertmanager.yml").write_text("route: {}")
+            (state / "alertmanager-data").mkdir()
+            (state / "pki").mkdir()
+            recipient = root / "recipients"
+            recipient.write_text("age1test")
+            recipient.chmod(0o600)
+            with (
+                patch("lab_dashboard.operations.validate_secret"),
+                patch(
+                    "lab_dashboard.operations.os.path.ismount",
+                    return_value=True,
+                ),
+                patch(
+                    "lab_dashboard.operations.subprocess.run",
+                    side_effect=FileNotFoundError("age"),
+                ),
+                self.assertRaises(OperationsError),
+            ):
+                create_backup(
+                    state,
+                    destination,
+                    recipient_file=recipient,
+                    unencrypted_for_test=False,
+                )
+
+            plaintext = list(destination.glob("*.tar.gz"))
+
+        self.assertEqual(plaintext, [])
 
 
 if __name__ == "__main__":

@@ -180,5 +180,33 @@ services:
       - no-new-privileges:true
     pids_limit: 64
 
+  operations-status:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lab-server-health-dashboard:0.1.0
+    user: "0:0"
+    network_mode: host
+    profiles: ["operations"]
+    entrypoint: ["python", "-m", "lab_dashboard.operations"]
+    command:
+      - status
+      - --state-directory
+      - /var/lib/lab-dashboard
+      - --backup-directory
+      - /var/backups/lab-server-health
+    volumes:
+      - dashboard-data:/var/lib/lab-dashboard:ro
+      - type: bind
+        source: "${BACKUP_DESTINATION:?required}"
+        target: /var/backups/lab-server-health
+        read_only: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+
 volumes:
   dashboard-data:

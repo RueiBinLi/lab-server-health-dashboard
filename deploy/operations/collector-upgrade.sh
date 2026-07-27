@@ -1,25 +1,42 @@
 #!/bin/sh
 set -eu
 
-package=${1:?usage: collector-upgrade.sh PACKAGE}
+installer=${1:?usage: collector-upgrade.sh INSTALLER SIGNATURE PUBLIC_KEY}
+signature=${2:?usage: collector-upgrade.sh INSTALLER SIGNATURE PUBLIC_KEY}
+public_key=${3:?usage: collector-upgrade.sh INSTALLER SIGNATURE PUBLIC_KEY}
 test "$(id -u)" -eq 0
-test -f "$package"
+test -f "$installer"
+test -f "$signature"
+test -f "$public_key"
+openssl pkeyutl -verify -pubin -inkey "$public_key" -rawin \
+    -in "$installer" -sigfile "$signature"
 install -d -m 0700 /var/lib/lab-server-health-collector/rollback
-package_name=$(dpkg-deb --field "$package" Package)
-installed_version=$(dpkg-query --showformat='${Version}' --show "$package_name")
-(
-    cd /var/lib/lab-server-health-collector/rollback
-    apt-get download "$package_name=$installed_version"
-)
-previous_package=$(find /var/lib/lab-server-health-collector/rollback \
-    -maxdepth 1 -type f -name '*.deb' | head -n 1)
-sha256sum /etc/lab-server-health-collector/* \
-    >/var/lib/lab-server-health-collector/rollback/config.sha256
-systemctl stop lab-server-health-collector.service
-if ! dpkg --install "$package"; then
-    dpkg --install "$previous_package"
-    systemctl start lab-server-health-collector.service
+rollback=$(mktemp -d \
+    /var/lib/lab-server-health-collector/rollback/release.XXXXXX)
+find /etc/lab-collector /usr/local/bin /usr/local/libexec \
+    /etc/systemd/system -type f \
+    \( -path '/etc/lab-collector/*' \
+    -o -name 'node_exporter' \
+    -o -name 'lab-collector-*' \
+    -o -name 'lab-critical-errors-*' \
+    -o -name 'lab-node-exporter.service' \
+    -o -name 'lab-dcgm-exporter.service' \) \
+    >"$rollback/package-files"
+tar -C / -czf "$rollback/previous-package.tar.gz" \
+    -T "$rollback/package-files"
+tar -C /etc -czf "$rollback/configuration.tar.gz" lab-collector
+find /etc/lab-collector -type f -exec sha256sum {} + \
+    >"$rollback/config.sha256"
+printf '%s\n' "$rollback" \
+    >/var/lib/lab-server-health-collector/rollback/last-valid
+systemctl stop lab-node-exporter.service
+if ! /bin/sh "$installer"; then
+    tar -C / -xzf "$rollback/previous-package.tar.gz"
+    tar -C /etc -xzf "$rollback/configuration.tar.gz"
+    systemctl daemon-reload
+    systemctl start lab-node-exporter.service
     exit 1
 fi
-systemctl start lab-server-health-collector.service
-systemctl is-active --quiet lab-server-health-collector.service
+systemctl start lab-node-exporter.service
+systemctl is-active --quiet lab-node-exporter.service
+sha256sum --check "$rollback/config.sha256"

@@ -6,7 +6,7 @@ After=docker.service
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/opt/lab-server-health-dashboard
+WorkingDirectory=/opt/lab-server-health-dashboard/current
 EnvironmentFile=/etc/lab-server-health/dashboard.env
 ExecStart=/usr/bin/docker compose --profile operations run --rm backup
 Nice=10

@@ -5,12 +5,13 @@ infrastructure. The central host must not run lab workloads.
 
 ## Deploy and validate
 
-Install the repository at `/opt/lab-server-health-dashboard`. Install the three
-units in `deploy/systemd/`, then run:
+Install each checkout under `/opt/lab-server-health-dashboard/releases/` and
+make `/opt/lab-server-health-dashboard/current` point to the active release.
+Install the three units in `deploy/systemd/`, then run from the active checkout:
 
 ```sh
 sudo install -d -m 0700 /etc/lab-server-health/secrets
-sudo python3 -m lab_dashboard.operations validate \
+sudo env PYTHONPATH=src python3 -m lab_dashboard.operations validate \
   --secret /etc/lab-server-health/secrets/smtp-password \
   --secret /etc/lab-server-health/secrets/slack-webhook \
   --secret /etc/lab-server-health/secrets/backup-recipients
@@ -32,6 +33,20 @@ test endpoint. Alert on central filesystem use above 80%, any unhealthy
 container, a collector certificate inside its renewal window, a backup older
 than 24 hours, or a failed channel test.
 
+The local machine-readable summary combines those checks:
+
+```sh
+sudo docker compose --profile operations run --rm operations-status
+```
+
+For Server Enrollment, register the Server Profile and server in the Lab
+Administrator dashboard, run the returned signed collector installer, compare
+its verification code and Server Inventory, then approve first contact. For channel testing,
+choose **Test notification channels** in the Lab Administrator dashboard,
+confirm both email and Slack delivery, and verify
+`channelTestRequestedWithin24Hours` here. That field proves the exercise is
+recent; the human delivery confirmation determines channel-test health.
+
 ## Backup and restore
 
 `lab-server-health-backup.timer` runs daily and writes age-encrypted archives
@@ -43,17 +58,22 @@ Prometheus TSDB and the offline root CA are explicitly excluded.
 Quarterly, copy one archive and the age identity to an isolated Ubuntu host:
 
 ```sh
-sudo python3 -m lab_dashboard.operations restore \
-  --archive BACKUP.tar.gz.age --identity-file /run/restore/identity \
-  --target /srv/lab-server-health-restore
+sudo docker run --rm --network none --user 0:0 --entrypoint python \
+  -v "$PWD:/backup:ro" \
+  -v /run/restore/identity:/run/restore/identity:ro \
+  -v /srv/lab-server-health-restore:/restore \
+  lab-server-health-dashboard:0.1.0 \
+  -m lab_dashboard.operations restore \
+  --archive /backup/BACKUP.tar.gz.age \
+  --identity-file /run/restore/identity --target /restore
 ```
 
 The command refuses a non-empty target, safely extracts, validates the manifest,
 and runs SQLite `quick_check`. Start a separate stack against that target and
-complete enrollment, notification-channel, and certificate checks within one
-working day. Record the archive timestamp (no more than 24 hours old), start and
-finish times, and results. Metric History is not restored: Prometheus rebuilds
-new history after collectors reconnect.
+complete Server Enrollment, notification-channel, and certificate checks within
+one working day. Record the archive timestamp (no more than 24 hours old), start
+and finish times, and results. Metric History is not restored: Prometheus
+rebuilds new history after collectors reconnect.
 
 For certificate recovery, keep the online intermediate in the encrypted backup.
 If it is suspected compromised, use the dashboard recovery action, replace it
@@ -68,8 +88,15 @@ the prior configuration. Exercise `central-rollback.sh` quarterly and confirm
 the ready endpoint and collector observation without stopping monitored lab
 workloads.
 
-Upgrade collectors one server at a time with `collector-upgrade.sh PACKAGE`.
-Wait for healthy observation and compare the retained configuration hashes
-before continuing to the next server. On failure the script reinstalls the
-retained package. Never restart a monitored workload as part of collector
-upgrade or rollback.
+Upgrade collectors one server at a time with
+`collector-upgrade.sh INSTALLER SIGNATURE PUBLIC_KEY`. The script verifies the
+signed installer and retains the current installed binaries, units, and
+configuration as the prior package before running it.
+Wait until the server's Server Health is Healthy and compare the retained
+configuration hashes before continuing to the next server. On failure the
+script reinstalls the retained package. Never restart a monitored workload as
+part of collector upgrade or rollback.
+
+To roll a collector back explicitly, run `collector-rollback.sh`; it restores
+the exact retained package and configuration, verifies the saved hashes, and
+restarts only the collector service.

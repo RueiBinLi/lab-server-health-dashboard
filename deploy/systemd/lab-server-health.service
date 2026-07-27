@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/opt/lab-server-health-dashboard
+WorkingDirectory=/opt/lab-server-health-dashboard/current
 EnvironmentFile=/etc/lab-server-health/dashboard.env
 ExecStart=/usr/bin/docker compose up --detach --wait
 ExecReload=/usr/bin/docker compose up --detach --wait

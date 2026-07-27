@@ -1,6 +1,9 @@
 FROM python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f
 
-RUN groupadd --gid 65532 dashboard \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends age=1.1.1-1+b3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 65532 dashboard \
     && useradd --uid 65532 --gid dashboard --no-create-home dashboard \
     && install -d -o dashboard -g dashboard /opt/lab-dashboard /var/lib/lab-dashboard
 
