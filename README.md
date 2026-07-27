@@ -1,7 +1,9 @@
 # Lab Server Health Dashboard
 
-The walking skeleton is a private, role-aware dashboard backed by SQLite. It
-binds only to loopback so Tailscale Serve can be the production entry point.
+The dashboard is a private, role-aware service backed by SQLite and Prometheus.
+Both services bind only to loopback so Tailscale Serve can be the production
+entry point. Prometheus scrapes each verified collector over its per-server
+mTLS identity every 30 seconds and retains Metric History locally for 30 days.
 Identity and application-capability headers are accepted only from configured
 trusted proxy networks. Tailscale Grants map `group:lab-admins` and
 `group:lab-users` to the Lab Administrator and Lab User roles.
@@ -61,6 +63,16 @@ tailscale serve --bg \
 ```
 
 Do not change `DASHBOARD_HOST` to a non-loopback address.
+Prometheus also listens only on `127.0.0.1:19090`; do not proxy that port through
+Tailscale Serve. The dashboard offers only server-scoped CPU, system-memory,
+and disk history queries to authorized viewers, rather than raw Prometheus or
+unrestricted PromQL access.
+
+Resource Usage reports CPU as percent used, memory and persistent filesystems
+as used/total GiB plus percent, and the age of the newest scrape. Missing series
+are displayed as missing instead of zero. Lab Administrators additionally see
+collector scrape success, while Lab Users do not receive scrape addresses,
+collector internals, or verified inventory.
 
 ## Verify the collector installer
 

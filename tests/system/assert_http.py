@@ -14,8 +14,10 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -170,23 +172,33 @@ def first_contact(
 
 
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
-    document = b"""# TYPE node_cpu_seconds_total counter
-node_cpu_seconds_total{cpu="0",mode="idle"} 1
+    started_at = time.monotonic()
+
+    @classmethod
+    def metrics_document(cls) -> bytes:
+        elapsed = time.monotonic() - cls.started_at
+        return f"""# TYPE node_cpu_seconds_total counter
+node_cpu_seconds_total{{cpu="0",mode="idle"}} {100 + elapsed * 0.75}
+node_cpu_seconds_total{{cpu="0",mode="user"}} {50 + elapsed * 0.25}
+node_load1 1.5
 node_memory_MemTotal_bytes 17179869184
-node_filesystem_size_bytes{mountpoint="/"} 1099511627776
-node_hwmon_temp_celsius{sensor="temp1"} 42
+node_memory_MemAvailable_bytes 10737418240
+node_filesystem_size_bytes{{mountpoint="/",fstype="ext4"}} 1099511627776
+node_filesystem_avail_bytes{{mountpoint="/",fstype="ext4"}} 824633720832
+node_hwmon_temp_celsius{{sensor="temp1"}} 42
 lab_critical_errors_total 0
-"""
+""".encode()
 
     def do_GET(self) -> None:
         if self.path != "/metrics":
             self.send_error(404)
             return
+        document = self.metrics_document()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(self.document)))
+        self.send_header("Content-Length", str(len(document)))
         self.end_headers()
-        self.wfile.write(self.document)
+        self.wfile.write(document)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -424,6 +436,76 @@ def main() -> None:
                 else:
                     raise AssertionError("normal observation did not begin")
 
+                prometheus_deadline = time.monotonic() + 70
+                while time.monotonic() < prometheus_deadline:
+                    resources = get(
+                        base_url,
+                        "/api/fleet",
+                        "ada@example.com",
+                        "lab-administrator",
+                    )[1]["fleet"][0].get("resourceUsage", {})
+                    if (
+                        resources.get("collector", {}).get("success") is True
+                        and resources.get("cpu", {}).get("usedPercent")
+                        is not None
+                    ):
+                        break
+                    time.sleep(0.5)
+                else:
+                    raise AssertionError(
+                        "Prometheus did not produce CPU Resource Usage: "
+                        f"{resources!r}"
+                    )
+                assert 24 <= resources["cpu"]["usedPercent"] <= 26
+                assert resources["systemMemory"] == {
+                    "usedBytes": 6_442_450_944.0,
+                    "totalBytes": 17_179_869_184.0,
+                    "usedPercent": 37.5,
+                }
+                assert resources["filesystems"][0]["usedPercent"] == 25.0
+                assert resources["freshness"]["state"] == "fresh"
+                workspace = get_text(
+                    base_url,
+                    f"/servers/{system_server['serverId']}",
+                    "lin@example.com",
+                    "lab-user",
+                )
+                assert workspace[0] == 200
+                for visible_value in (
+                    "Selected-server workspace",
+                    "Resource Usage",
+                    "25.0%",
+                    "6.0 GiB / 16.0 GiB",
+                    "Metric History",
+                    'type="datetime-local"',
+                    'name="mountpoint"',
+                    "<table",
+                ):
+                    assert visible_value in workspace[1]
+                assert source_address not in workspace[1]
+                assert "Verified Server Inventory" not in workspace[1]
+                now = datetime.now(UTC)
+                query = urllib.parse.urlencode(
+                    {
+                        "metric": "cpu",
+                        "start": (now - timedelta(hours=1)).isoformat(),
+                        "end": now.isoformat(),
+                        "step": "30",
+                    }
+                )
+                history = get(
+                    base_url,
+                    (
+                        f"/api/servers/{system_server['serverId']}"
+                        f"/metric-history?{query}"
+                    ),
+                    "lin@example.com",
+                    "lab-user",
+                )
+                assert history[0] == 200
+                assert history[1]["metric"] == "cpu"
+                assert history[1]["points"]
+
         rejection_server = registered_server(
             administrator[1]["fleet"], "Rejected System Test Server"
         )
@@ -582,14 +664,17 @@ def main() -> None:
     for profile in (general, gpu):
         assert "reachability" in profile["definition"]["requiredObservations"]
         assert "critical-errors" in profile["definition"]["requiredObservations"]
-    assert lab_user == (
-        200,
-        {
-            "viewer": {"login": "lin@example.com", "role": "lab-user"},
-            "fleet": [],
-            "emptyMessage": "No servers are available yet.",
-        },
-    )
+    assert lab_user[0] == 200
+    assert lab_user[1]["viewer"] == {
+        "login": "lin@example.com",
+        "role": "lab-user",
+    }
+    assert len(lab_user[1]["fleet"]) == 1
+    safe_server = lab_user[1]["fleet"][0]
+    assert safe_server["serverId"] == server["serverId"]
+    assert "scrapeAddress" not in safe_server
+    assert "inventory" not in safe_server
+    assert "collector" not in safe_server["resourceUsage"]
     assert user_profiles == (403, {"error": "access_denied"})
     assert user_registration == (403, {"error": "access_denied"})
     assert duplicate == (409, {"error": "display_name_conflict"})

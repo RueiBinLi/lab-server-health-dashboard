@@ -12,6 +12,10 @@ from lab_dashboard.database import (
     list_active_observation_targets,
     record_observation_run,
 )
+from lab_dashboard.prometheus import (
+    PrometheusUnavailable,
+    reconcile_prometheus,
+)
 
 
 MAX_METRICS_BYTES = 4 * 1024 * 1024
@@ -41,8 +45,9 @@ class TelemetryUnavailable(Exception):
 
 
 class ObservationEngine:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, prometheus_url: str) -> None:
         self._database_path = database_path
+        self._prometheus_url = prometheus_url
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._thread = threading.Thread(
@@ -65,6 +70,12 @@ class ObservationEngine:
 
     def _run(self) -> None:
         while not self._stopping.is_set():
+            try:
+                reconcile_prometheus(
+                    self._database_path, self._prometheus_url
+                )
+            except PrometheusUnavailable:
+                pass
             self._observe_active_targets()
             self._wake.wait(timeout=30)
             self._wake.clear()

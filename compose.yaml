@@ -12,6 +12,7 @@ services:
       DASHBOARD_HOST: 127.0.0.1
       DASHBOARD_PORT: "${DASHBOARD_PORT:-3000}"
       DASHBOARD_TRUSTED_PROXY_CIDRS: 127.0.0.0/8,::1/128
+      DASHBOARD_PROMETHEUS_URL: http://127.0.0.1:19090
     volumes:
       - dashboard-data:/var/lib/lab-dashboard
     read_only: true
@@ -40,6 +41,32 @@ services:
       start_period: 5s
     cpus: 0.50
     mem_limit: 256m
+
+  prometheus:
+    image: prom/prometheus:v3.11.3-distroless@sha256:cff72a3f49918f41c4b5c8a6174dd8433036bebf7878120da538b3720ba3fa0d
+    network_mode: host
+    command:
+      - --config.file=/var/lib/lab-dashboard/prometheus.yml
+      - --storage.tsdb.path=/var/lib/lab-dashboard/prometheus-data
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:19090
+      - --web.enable-lifecycle
+    volumes:
+      - dashboard-data:/var/lib/lab-dashboard
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    cpus: 0.50
+    mem_limit: 512m
 
 volumes:
   dashboard-data:

@@ -11,6 +11,7 @@ from pathlib import Path
 class DashboardConfig:
     database_path: Path
     trusted_proxy_networks: tuple[str, ...]
+    prometheus_url: str = "http://127.0.0.1:9090"
 
 
 class ConfigurationError(Exception):
@@ -42,4 +43,7 @@ def load_config(environment: Mapping[str, str] | None = None) -> DashboardConfig
             )
         ),
         trusted_proxy_networks=trusted_proxy_networks,
+        prometheus_url=values.get(
+            "DASHBOARD_PROMETHEUS_URL", "http://127.0.0.1:9090"
+        ).rstrip("/"),
     )

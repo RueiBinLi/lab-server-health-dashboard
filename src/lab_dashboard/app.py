@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from datetime import datetime
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from lab_dashboard.auth import Role, Viewer, authorize
@@ -58,9 +60,67 @@ from lab_dashboard.pki import (
     issue_collector_certificate,
 )
 from lab_dashboard.presentation import empty_fleet_experience
+from lab_dashboard.prometheus import (
+    HISTORY_METRICS,
+    InvalidHistoryQuery,
+    PrometheusUnavailable,
+    ResourceUsage,
+    current_resource_usage,
+    query_metric_history,
+    reconcile_prometheus,
+    sync_prometheus_config,
+    unavailable_resource_usage,
+)
 
 
 MAX_REQUEST_BODY_BYTES = 16_384
+
+
+def _single_parameter(
+    parameters: dict[str, list[str]], name: str
+) -> str:
+    values = parameters.get(name, [])
+    if len(values) != 1 or not values[0]:
+        raise InvalidHistoryQuery
+    return values[0]
+
+
+def _format_percent(value: object) -> str:
+    number = _display_number(value)
+    return "Missing" if number is None else f"{number:.1f}%"
+
+
+def _format_capacity(used: object, total: object) -> str:
+    if used is None or total is None:
+        return "Missing"
+    used_number = _display_number(used)
+    total_number = _display_number(total)
+    if used_number is None or total_number is None:
+        return "Missing"
+    gibibyte = 1024**3
+    return (
+        f"{used_number / gibibyte:.1f} GiB / "
+        f"{total_number / gibibyte:.1f} GiB"
+    )
+
+
+def _format_age(value: object) -> str:
+    number = _display_number(value)
+    return (
+        "last observation unavailable"
+        if number is None
+        else f"{number:.0f} s old"
+    )
+
+
+def _display_number(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _format_success(value: object) -> str:
+    if value is None:
+        return "Unavailable"
+    return "Succeeded" if value is True else "Failed"
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -79,9 +139,12 @@ def create_server(
     config: DashboardConfig, address: tuple[str, int]
 ) -> DashboardServer:
     initialize_database(config.database_path)
+    sync_prometheus_config(config.database_path)
     server = DashboardServer(address, DashboardRequestHandler)
     server.config = config
-    server.observation_engine = ObservationEngine(config.database_path)
+    server.observation_engine = ObservationEngine(
+        config.database_path, config.prometheus_url
+    )
     return server
 
 
@@ -89,22 +152,43 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     server: DashboardServer
 
     def do_GET(self) -> None:
-        if self.path == "/health/live":
+        request = urlsplit(self.path)
+        path = request.path
+        if path == "/health/live":
             self._send_json(HTTPStatus.OK, {"status": "ok"})
             return
-        if self.path == "/health/ready":
+        if path == "/health/ready":
             self._send_readiness()
             return
-        if self.path == "/api/fleet":
+        if path == "/api/fleet":
             self._send_fleet()
             return
-        if self.path == "/api/server-profiles":
+        if path == "/api/server-profiles":
             self._send_server_profiles()
             return
-        if self.path == "/api/audit-events":
+        if path == "/api/audit-events":
             self._send_audit_events()
             return
-        if self.path == "/":
+        server_prefix = "/api/servers/"
+        history_suffix = "/metric-history"
+        if path.startswith(server_prefix) and path.endswith(history_suffix):
+            server_id = path[len(server_prefix) : -len(history_suffix)]
+            self._send_metric_history(
+                server_id, parse_qs(request.query, keep_blank_values=True)
+            )
+            return
+        if path.startswith(server_prefix):
+            server_id = path[len(server_prefix) :]
+            if "/" not in server_id:
+                self._send_server(server_id)
+                return
+        workspace_prefix = "/servers/"
+        if path.startswith(workspace_prefix):
+            server_id = path[len(workspace_prefix) :]
+            if "/" not in server_id:
+                self._send_dashboard(selected_server_id=server_id)
+                return
+        if path == "/":
             self._send_dashboard()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
@@ -151,16 +235,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         experience = empty_fleet_experience(viewer.role)
-        fleet = (
-            [
-                self._administrator_server_response(server)
-                for server in list_registered_servers(
-                    self.server.config.database_path
-                )
-            ]
-            if viewer.role is Role.LAB_ADMINISTRATOR
-            else []
-        )
+        servers = list_registered_servers(self.server.config.database_path)
+        fleet = [
+            self._fleet_server_response(server, viewer.role)
+            for server in servers
+            if (
+                viewer.role is Role.LAB_ADMINISTRATOR
+                or server.enrollment_state == "active"
+            )
+        ]
         self._send_json(
             HTTPStatus.OK,
             {
@@ -441,7 +524,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(
             HTTPStatus.OK,
-            {"server": self._administrator_server_response(server)},
+            {
+                "server": self._fleet_server_response(
+                    server, Role.LAB_ADMINISTRATOR
+                )
+            },
         )
 
     def _send_enrollment_requirements(self) -> None:
@@ -521,9 +608,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(
             HTTPStatus.OK,
-            {"server": self._administrator_server_response(server)},
+            {
+                "server": self._fleet_server_response(
+                    server, Role.LAB_ADMINISTRATOR
+                )
+            },
         )
         if decision.kind is EnrollmentDecisionKind.APPROVE:
+            try:
+                reconcile_prometheus(
+                    self.server.config.database_path,
+                    self.server.config.prometheus_url,
+                )
+            except PrometheusUnavailable:
+                pass
             self.server.observation_engine.wake()
 
     def _lab_administrator(self) -> Viewer | None:
@@ -599,6 +697,134 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
         return response
 
+    def _fleet_server_response(
+        self, server: RegisteredServer, role: Role
+    ) -> dict[str, object]:
+        if role is Role.LAB_ADMINISTRATOR:
+            response = self._administrator_server_response(server)
+        else:
+            response = {
+                "serverId": server.server_id,
+                "displayName": server.display_name,
+                "profile": {
+                    "profileId": server.profile.profile_id,
+                    "name": server.profile.name,
+                    "revision": server.profile.revision,
+                },
+                "enrollmentState": server.enrollment_state,
+                "serverHealth": None,
+            }
+        if server.enrollment_state == "active":
+            resource_usage = dict(self._resource_usage(server))
+            if role is Role.LAB_USER:
+                resource_usage.pop("collector", None)
+            response["resourceUsage"] = resource_usage
+        return response
+
+    def _resource_usage(self, server: RegisteredServer) -> ResourceUsage:
+        mounts = server.profile.definition.get("persistentMounts", ["/"])
+        mount_values = mounts if isinstance(mounts, list) else ["/"]
+        mountpoints = tuple(
+            mount for mount in mount_values if isinstance(mount, str)
+        )
+        try:
+            return current_resource_usage(
+                self.server.config.prometheus_url,
+                server.server_id,
+                mountpoints,
+            )
+        except PrometheusUnavailable:
+            return unavailable_resource_usage(mountpoints)
+
+    def _send_server(self, server_id: str) -> None:
+        viewer = self._authorized_viewer()
+        if viewer is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"})
+            return
+        server = next(
+            (
+                candidate
+                for candidate in list_registered_servers(
+                    self.server.config.database_path
+                )
+                if candidate.server_id == server_id
+            ),
+            None,
+        )
+        if server is None or (
+            viewer.role is Role.LAB_USER
+            and server.enrollment_state != "active"
+        ):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {"server": self._fleet_server_response(server, viewer.role)},
+        )
+
+    def _send_metric_history(
+        self, server_id: str, parameters: dict[str, list[str]]
+    ) -> None:
+        viewer = self._authorized_viewer()
+        if viewer is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"})
+            return
+        server = next(
+            (
+                candidate
+                for candidate in list_registered_servers(
+                    self.server.config.database_path
+                )
+                if candidate.server_id == server_id
+                and candidate.enrollment_state == "active"
+            ),
+            None,
+        )
+        try:
+            metric = _single_parameter(parameters, "metric")
+            start = datetime.fromisoformat(
+                _single_parameter(parameters, "start")
+            )
+            end = datetime.fromisoformat(
+                _single_parameter(parameters, "end")
+            )
+            step = int(_single_parameter(parameters, "step"))
+            mountpoint = parameters.get("mountpoint", ["/"])
+            persistent_mounts = (
+                server.profile.definition.get("persistentMounts", ["/"])
+                if server is not None
+                else []
+            )
+            if (
+                server is None
+                or metric not in HISTORY_METRICS
+                or len(mountpoint) != 1
+                or not isinstance(persistent_mounts, list)
+                or mountpoint[0] not in persistent_mounts
+            ):
+                raise InvalidHistoryQuery
+            history = query_metric_history(
+                self.server.config.prometheus_url,
+                server_id=server_id,
+                metric=metric,
+                start=start,
+                end=end,
+                step=step,
+                mountpoint=mountpoint[0],
+            )
+        except (InvalidHistoryQuery, TypeError, ValueError):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_history_query"}
+            )
+            return
+        except PrometheusUnavailable:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "metric_history_unavailable"},
+            )
+            return
+        self._send_json(HTTPStatus.OK, history)
+
     def _authorized_viewer(self) -> Viewer | None:
         return authorize(
             login=self.headers.get("Tailscale-User-Login", ""),
@@ -632,20 +858,43 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     return str(forwarded_address)
         return str(peer_address)
 
-    def _send_dashboard(self) -> None:
+    def _send_dashboard(
+        self, selected_server_id: str | None = None
+    ) -> None:
         viewer = self._authorized_viewer()
         if viewer is None:
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"})
             return
 
         experience = empty_fleet_experience(viewer.role)
-        servers = (
-            list_registered_servers(self.server.config.database_path)
-            if viewer.role is Role.LAB_ADMINISTRATOR
-            else []
-        )
+        servers = [
+            server
+            for server in list_registered_servers(
+                self.server.config.database_path
+            )
+            if (
+                viewer.role is Role.LAB_ADMINISTRATOR
+                or server.enrollment_state == "active"
+            )
+        ]
+        if selected_server_id is not None:
+            servers = [
+                server
+                for server in servers
+                if server.server_id == selected_server_id
+            ]
+            if not servers:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
         content = (
-            "".join(self._server_card(server) for server in servers)
+            "".join(
+                self._server_card(
+                    server,
+                    viewer.role,
+                    selected=selected_server_id is not None,
+                )
+                for server in servers
+            )
             if servers
             else f"""
     <section class="empty" aria-labelledby="empty-heading">
@@ -678,12 +927,24 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     .actions {{ display: flex; gap: .75rem; flex-wrap: wrap; }}
     button {{ padding: .65rem 1rem; border: 0; border-radius: .45rem;
       cursor: pointer; }}
+    .usage {{ display: grid; grid-template-columns: repeat(auto-fit,
+      minmax(12rem, 1fr)); gap: .75rem; }}
+    .usage div {{ padding: 1rem; border-radius: .6rem; background: #101827; }}
+    .history-output {{ min-height: 2rem; white-space: pre-wrap; }}
   </style>
 </head>
 <body>
   <main>
     <header>
-      <div><h1>Lab Server Health</h1><p>Fleet overview</p></div>
+      <div><h1>Lab Server Health</h1><p>{
+          "Selected-server workspace"
+          if selected_server_id is not None
+          else "Fleet overview"
+      }</p>{
+          '<a href="/">Back to fleet</a>'
+          if selected_server_id is not None
+          else ""
+      }</div>
       <p class="role">
         {escape(viewer.role.value.replace("-", " ").title())}<br>
         {escape(viewer.login)}
@@ -696,6 +957,42 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
       const button = event.target.closest("button[data-server-id]");
       if (!button) return;
       const serverId = button.dataset.serverId;
+      if (button.dataset.action === "history") {{
+        const workspace = button.closest(".history");
+        const metric = workspace.querySelector("[name=metric]").value;
+        const selectedEnd = workspace.querySelector("[name=end]").value;
+        const end = selectedEnd ? new Date(selectedEnd) : new Date();
+        const selectedStart = workspace.querySelector("[name=start]").value;
+        const start = selectedStart
+          ? new Date(selectedStart)
+          : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+        const step = workspace.querySelector("[name=step]").value;
+        const mountpoint = workspace.querySelector("[name=mountpoint]").value;
+        const query = new URLSearchParams({{
+          metric, start: start.toISOString(), end: end.toISOString(),
+          step, mountpoint
+        }});
+        const response = await fetch(
+          `/api/servers/${{serverId}}/metric-history?${{query}}`
+        );
+        const payload = await response.json();
+        const output = workspace.querySelector(".history-output");
+        output.replaceChildren();
+        if (!response.ok) {{
+          output.textContent = payload.error;
+          return;
+        }}
+        for (const point of payload.points) {{
+          const row = document.createElement("tr");
+          for (const value of [point.observedAt, point.value ?? "Missing"]) {{
+            const cell = document.createElement("td");
+            cell.textContent = value;
+            row.appendChild(cell);
+          }}
+          output.appendChild(row);
+        }}
+        return;
+      }}
       const action = button.dataset.action;
       let path = `/api/servers/${{serverId}}/staged-telemetry-checks`;
       let body = {{}};
@@ -731,8 +1028,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "text/html; charset=utf-8",
         )
 
-    @staticmethod
-    def _server_card(server: RegisteredServer) -> str:
+    def _server_card(
+        self, server: RegisteredServer, role: Role, *, selected: bool
+    ) -> str:
         heading = escape(server.display_name)
         state = escape(server.enrollment_state)
         review_html = ""
@@ -779,14 +1077,114 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         <button data-server-id="{escape(server.server_id)}"
           data-action="reject" data-verification-code="{code}">Reject</button>
       </div>"""
-        elif server.inventory is not None:
+        elif (
+            server.inventory is not None
+            and role is Role.LAB_ADMINISTRATOR
+        ):
             review_html = f"""
       <h3>Verified Server Inventory</h3>
       <pre>{escape(json.dumps(server.inventory.as_document(), indent=2, sort_keys=True))}</pre>"""
+        usage_html = ""
+        if server.enrollment_state == "active":
+            usage = self._resource_usage(server)
+            cpu = _format_percent(usage["cpu"]["usedPercent"])
+            memory = usage["systemMemory"]
+            memory_value = _format_capacity(
+                memory["usedBytes"], memory["totalBytes"]
+            )
+            filesystems = usage["filesystems"]
+            disks = "".join(
+                (
+                    "<div><strong>Disk "
+                    + escape(str(filesystem["mountpoint"]))
+                    + "</strong><br>"
+                    + escape(
+                        _format_capacity(
+                            filesystem["usedBytes"],
+                            filesystem["totalBytes"],
+                        )
+                    )
+                    + " · "
+                    + escape(_format_percent(filesystem["usedPercent"]))
+                    + "</div>"
+                )
+                for filesystem in filesystems
+            )
+            freshness = usage["freshness"]
+            administrator_collector = ""
+            if role is Role.LAB_ADMINISTRATOR:
+                collector = usage["collector"]
+                administrator_collector = (
+                    "<div><strong>Collector scrape</strong><br>"
+                    + escape(_format_success(collector["success"]))
+                    + "</div>"
+                )
+            mount_options = "".join(
+                (
+                    '<option value="'
+                    + escape(str(filesystem["mountpoint"]), quote=True)
+                    + '">'
+                    + escape(str(filesystem["mountpoint"]))
+                    + "</option>"
+                )
+                for filesystem in filesystems
+            )
+            history_html = (
+                f"""
+      <section class="history">
+        <h3>Metric History</h3>
+        <p>Query any interval in the retained 30-day observation window.</p>
+        <label>Metric
+          <select name="metric">
+            <option value="cpu">CPU used (%)</option>
+            <option value="system-memory">System memory used (%)</option>
+            <option value="disk">Persistent filesystem used (%)</option>
+          </select>
+        </label>
+        <label>Filesystem
+          <select name="mountpoint">{mount_options}</select>
+        </label>
+        <label>Start <input name="start" type="datetime-local"></label>
+        <label>End <input name="end" type="datetime-local"></label>
+        <label>Resolution
+          <select name="step">
+            <option value="300">5 minutes</option>
+            <option value="3600" selected>1 hour</option>
+            <option value="86400">1 day</option>
+          </select>
+        </label>
+        <button data-server-id="{escape(server.server_id)}"
+          data-action="history">Query history</button>
+        <table>
+          <thead><tr><th>Observed at</th><th>Value (%)</th></tr></thead>
+          <tbody class="history-output" aria-live="polite"></tbody>
+        </table>
+      </section>"""
+                if selected
+                else (
+                    '<p><a href="/servers/'
+                    + escape(server.server_id, quote=True)
+                    + '">Open selected-server workspace</a></p>'
+                )
+            )
+            usage_html = f"""
+      <h3>Resource Usage</h3>
+      <div class="usage">
+        <div><strong>CPU</strong><br>{escape(cpu)}</div>
+        <div><strong>System memory</strong><br>{escape(memory_value)}
+          · {escape(_format_percent(memory["usedPercent"]))}</div>
+        {disks}
+        <div><strong>Data freshness</strong><br>
+          {escape(str(freshness["state"]))} ·
+          {escape(_format_age(freshness["ageSeconds"]))}</div>
+        {administrator_collector}
+      </div>
+      {history_html}"""
         return f"""
     <article class="server">
       <h2>{heading}</h2>
       <p>Server ID: {escape(server.server_id)} · Enrollment: {state}</p>
+      {usage_html}
       {review_html}
     </article>"""
 
