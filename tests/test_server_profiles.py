@@ -774,6 +774,68 @@ class ServerProfileLifecycleTests(unittest.TestCase):
             (422, {"error": "profile_not_published"}),
         )
 
+    def test_publication_preserves_an_explicitly_staged_assignment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with RunningDashboard() as dashboard:
+                server_id = activate_server(dashboard, Path(temporary))
+                dashboard.post(
+                    "/api/server-profiles",
+                    {
+                        "profileId": "compute-linux",
+                        "name": "Compute Linux Server",
+                        "sourceProfileId": "general-linux",
+                        "sourceRevision": 1,
+                        "reason": "Create the intended compute role",
+                    },
+                    ADMINISTRATOR,
+                )
+                dashboard.post(
+                    "/api/server-profiles/compute-linux/revisions/1/publish",
+                    {"reason": "Generated configuration validated"},
+                    ADMINISTRATOR,
+                )
+                staged = dashboard.post(
+                    f"/api/servers/{server_id}/profile-assignments",
+                    {
+                        "profileId": "compute-linux",
+                        "revision": 1,
+                        "reason": "Move the host to its intended role",
+                    },
+                    ADMINISTRATOR,
+                )
+                dashboard.post(
+                    "/api/server-profiles/general-linux/revisions",
+                    {
+                        "name": "General Linux Server",
+                        "definition": general_linux_definition(),
+                        "reason": "Prepare an unrelated profile publication",
+                    },
+                    ADMINISTRATOR,
+                )
+                dashboard.post(
+                    "/api/server-profiles/general-linux/revisions/2/publish",
+                    {"reason": "Publish without replacing explicit work"},
+                    ADMINISTRATOR,
+                )
+                delivered = dashboard.get(
+                    f"/api/collectors/{server_id}/profile-configuration",
+                    {"X-Verified-Collector-Server-ID": server_id},
+                )
+                server = dashboard.get(
+                    f"/api/servers/{server_id}", ADMINISTRATOR
+                )
+
+        self.assertEqual(staged[0], 202)
+        self.assertEqual(
+            delivered[1]["configuration"]["profileId"], "compute-linux"
+        )
+        self.assertEqual(
+            server[1]["server"]["pendingProfileConfiguration"]["operation"],
+            "assignment",
+        )
+
     def test_activated_threshold_override_changes_health_not_global_timing(
         self,
     ) -> None:

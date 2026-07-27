@@ -151,8 +151,8 @@ class ResourceUsageHttpTests(unittest.TestCase):
             "metric": "cpu",
             "unit": "percent",
             "points": [
-                {"observedAt": "2026-07-26T10:00:00+00:00", "value": 12.5},
-                {"observedAt": "2026-07-27T10:00:00+00:00", "value": None},
+                {"observedAt": "2000-01-01T00:00:00+00:00", "value": 12.5},
+                {"observedAt": "9999-01-01T00:00:00+00:00", "value": None},
             ],
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -182,15 +182,14 @@ class ResourceUsageHttpTests(unittest.TestCase):
         self.assertEqual(unrestricted, (400, {"error": "invalid_history_query"}))
         query.assert_called_once()
         self.assertIsNone(response[1]["points"][1]["value"])
+        self.assertNotIn("profileId", response[1]["points"][0])
+        self.assertNotIn("profileRevision", response[1]["points"][0])
         self.assertEqual(
-            {
-                (
-                    point["profileId"],
-                    point["profileRevision"],
-                )
-                for point in response[1]["points"]
-            },
-            {("general-linux", 1)},
+            (
+                response[1]["points"][1]["profileId"],
+                response[1]["points"][1]["profileRevision"],
+            ),
+            ("general-linux", 1),
         )
 
 
