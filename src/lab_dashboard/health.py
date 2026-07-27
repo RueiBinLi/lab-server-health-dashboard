@@ -40,6 +40,17 @@ class GpuHealthObservation(TypedDict):
     aggregateUncorrectableEcc: float | None
 
 
+class CriticalErrorHealthObservation(TypedDict):
+    oomKillEvent: bool | None
+    readOnlyFilesystems: list[str]
+    storageIoErrorEvent: bool | None
+    previousPanicEvent: bool | None
+    watchdogResetEvent: bool | None
+    helperFresh: bool | None
+    evidenceAvailable: bool | None
+    textfileScrapeSuccessful: bool | None
+
+
 class HealthObservation(TypedDict):
     primaryTelemetrySuccessful: bool | None
     requiredObservationsComplete: bool | None
@@ -52,6 +63,7 @@ class HealthObservation(TypedDict):
     gpus: NotRequired[list[GpuHealthObservation]]
     gpuCoverageExpected: NotRequired[bool]
     inventoryMatchesProfile: NotRequired[bool | None]
+    criticalErrors: NotRequired[CriticalErrorHealthObservation]
 
 
 class HealthCause(TypedDict):
@@ -85,6 +97,12 @@ class HealthEvaluation(TypedDict):
     serverHealth: ServerHealth
     activeHealthCauses: list[HealthCause]
     serverIncidents: list[ServerIncident]
+
+
+class CriticalErrorAcknowledgment(TypedDict):
+    rule: str
+    acknowledgedAt: str
+    acknowledgedBy: str
 
 
 class _RuleState(TypedDict):
@@ -338,6 +356,17 @@ def initialize_health_database(path: Path) -> None:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS critical_error_acknowledgments (
+                    server_id TEXT NOT NULL REFERENCES servers(server_id),
+                    rule TEXT NOT NULL,
+                    acknowledged_at TEXT NOT NULL,
+                    acknowledged_by TEXT NOT NULL,
+                    PRIMARY KEY (server_id, rule)
+                )
+                """
+            )
 
 
 def evaluate_server_health(
@@ -367,6 +396,18 @@ def evaluate_server_health(
             else {}
         )
         conditions = _rule_conditions(observation, threshold_overrides)
+        if observation.get("criticalErrors") is not None:
+            for rule in states:
+                if (
+                    rule.startswith("filesystem-read-only:")
+                    and rule not in conditions
+                ):
+                    conditions[rule] = _RuleCondition(
+                        firing=False,
+                        clearing=True,
+                        firing_seconds=0,
+                        clearing_seconds=5 * 60,
+                    )
         if observation.get("gpuCoverageExpected") is True:
             for rule in states:
                 if rule.startswith("gpu-") and rule not in conditions:
@@ -443,6 +484,76 @@ def evaluate_server_health(
         "activeHealthCauses": causes,
         "serverIncidents": incidents,
     }
+
+
+def acknowledge_critical_error(
+    path: Path,
+    *,
+    server_id: str,
+    rule: str,
+    actor: str,
+    now: datetime,
+) -> CriticalErrorAcknowledgment:
+    if not is_critical_error_rule(rule) or now.tzinfo is None:
+        raise ValueError("invalid Critical Error acknowledgment")
+    acknowledged_at = now.astimezone(UTC).isoformat()
+    with closing(_connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO critical_error_acknowledgments (
+                    server_id, rule, acknowledged_at, acknowledged_by
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(server_id, rule) DO UPDATE SET
+                    acknowledged_at = excluded.acknowledged_at,
+                    acknowledged_by = excluded.acknowledged_by
+                """,
+                (server_id, rule, acknowledged_at, actor),
+            )
+    return {
+        "rule": rule,
+        "acknowledgedAt": acknowledged_at,
+        "acknowledgedBy": actor,
+    }
+
+
+def list_critical_error_acknowledgments(
+    path: Path, server_id: str
+) -> dict[str, CriticalErrorAcknowledgment]:
+    with closing(_connect(path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT rule, acknowledged_at, acknowledged_by
+            FROM critical_error_acknowledgments
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchall()
+    return {
+        row["rule"]: {
+            "rule": row["rule"],
+            "acknowledgedAt": row["acknowledged_at"],
+            "acknowledgedBy": row["acknowledged_by"],
+        }
+        for row in rows
+    }
+
+
+def is_critical_error_rule(rule: str) -> bool:
+    return (
+        rule
+        in {
+            "oom-kill",
+            "storage-io-error",
+            "previous-panic",
+            "watchdog-reset",
+            "critical-error-observation",
+        }
+        or rule.startswith("filesystem-read-only:")
+        or rule.startswith("gpu-xid:")
+        or rule.startswith("gpu-reset:")
+        or rule.startswith("gpu-ecc-")
+    )
 
 
 def _rule_conditions(
@@ -624,6 +735,45 @@ def _rule_conditions(
             ),
             firing_seconds=5 * 60,
             clearing_seconds=10 * 60,
+        )
+    critical_errors = observation.get("criticalErrors")
+    if critical_errors is not None:
+        for mountpoint in critical_errors.get("readOnlyFilesystems", []):
+            conditions[f"filesystem-read-only:{mountpoint}"] = _RuleCondition(
+                firing=True,
+                clearing=False,
+                firing_seconds=0,
+                clearing_seconds=5 * 60,
+            )
+        for rule, event in (
+            ("oom-kill", critical_errors.get("oomKillEvent")),
+            ("storage-io-error", critical_errors.get("storageIoErrorEvent")),
+            ("previous-panic", critical_errors.get("previousPanicEvent")),
+            ("watchdog-reset", critical_errors.get("watchdogResetEvent")),
+        ):
+            conditions[rule] = _RuleCondition(
+                firing=event if isinstance(event, bool) else None,
+                clearing=not event if isinstance(event, bool) else None,
+                firing_seconds=0,
+                clearing_seconds=30 * 60,
+            )
+        coverage = (
+            critical_errors.get("helperFresh"),
+            critical_errors.get("evidenceAvailable"),
+            critical_errors.get("textfileScrapeSuccessful"),
+        )
+        complete_coverage = (
+            None
+            if any(not isinstance(value, bool) for value in coverage)
+            else all(coverage)
+        )
+        conditions["critical-error-observation"] = _RuleCondition(
+            firing=(
+                None if complete_coverage is None else not complete_coverage
+            ),
+            clearing=complete_coverage,
+            firing_seconds=10 * 60,
+            clearing_seconds=5 * 60,
         )
     for gpu in observation.get("gpus", []):
         gpu_uuid = gpu.get("gpuUuid")
@@ -918,6 +1068,21 @@ def _ordered_rules(states: dict[str, _RuleState]) -> list[str]:
 
 
 def _summary(rule: str) -> str:
+    critical_summaries = {
+        "oom-kill": "The host reported an out-of-memory kill.",
+        "storage-io-error": "The host reported a storage I/O error.",
+        "previous-panic": "Evidence of a prior kernel panic was detected.",
+        "watchdog-reset": "Evidence of a watchdog reset was detected.",
+        "critical-error-observation": (
+            "Critical Error evidence is unavailable or stale."
+        ),
+    }
+    if rule in critical_summaries:
+        return critical_summaries[rule]
+    if rule.startswith("filesystem-read-only:"):
+        return (
+            f"Persistent filesystem {rule.split(':', 1)[1]} is read-only."
+        )
     if rule.startswith("disk-capacity:"):
         return f"Persistent filesystem {rule.split(':', 1)[1]} is low on space."
     if rule.startswith("disk-exhaustion:"):

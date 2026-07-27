@@ -6,6 +6,7 @@ from datetime import datetime
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -77,10 +78,13 @@ from lab_dashboard.enrollment import (
 from lab_dashboard.installer import signed_installer
 from lab_dashboard.health import (
     HealthEvaluation,
+    acknowledge_critical_error,
     critical_alert_metrics,
     evaluate_server_health,
     health_now,
     initialize_health_database,
+    is_critical_error_rule,
+    list_critical_error_acknowledgments,
 )
 from lab_dashboard.observation import (
     ObservationEngine,
@@ -218,6 +222,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if path == "/metrics":
             self._send_critical_alert_metrics()
             return
+        asset_prefix = "/api/collector-assets/"
+        if path.startswith(asset_prefix):
+            asset = path[len(asset_prefix) :]
+            if asset in {
+                "lab-critical-errors-evidence",
+                "lab-critical-errors-helper",
+            }:
+                content = (
+                    Path(__file__).parents[2]
+                    / "deploy"
+                    / "collector"
+                    / asset
+                ).read_bytes()
+                self._send_bytes(
+                    HTTPStatus.OK,
+                    content,
+                    "application/octet-stream",
+                )
+                return
         if path == "/api/fleet":
             self._send_fleet()
             return
@@ -315,6 +338,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_enrollment_requirements()
             return
         prefix = "/api/servers/"
+        acknowledgment_suffix = "/critical-error-acknowledgments"
+        if self.path.startswith(prefix) and self.path.endswith(
+            acknowledgment_suffix
+        ):
+            server_id = self.path[
+                len(prefix) : -len(acknowledgment_suffix)
+            ]
+            self._acknowledge_critical_error(server_id)
+            return
         activation_suffix = "/profile-activations"
         if self.path.startswith(prefix) and self.path.endswith(
             activation_suffix
@@ -1287,11 +1319,56 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "activeHealthCauses"
                 ]
                 response["serverIncidents"] = evaluation["serverIncidents"]
+                acknowledgments = list_critical_error_acknowledgments(
+                    self.server.config.database_path, server.server_id
+                )
+                response["criticalErrors"] = [
+                    {
+                        **cause,
+                        "acknowledgment": acknowledgments.get(cause["rule"]),
+                    }
+                    for cause in evaluation["activeHealthCauses"]
+                    if is_critical_error_rule(cause["rule"])
+                ]
             resource_usage = dict(self._resource_usage(server))
             if role is Role.LAB_USER:
                 resource_usage.pop("collector", None)
             response["resourceUsage"] = resource_usage
         return response
+
+    def _acknowledge_critical_error(self, server_id: str) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        server_exists = any(
+            server.server_id == server_id
+            for server in list_registered_servers(
+                self.server.config.database_path
+            )
+        )
+        document = self._read_json()
+        rule = document.get("rule") if isinstance(document, dict) else None
+        if not server_exists or not isinstance(rule, str):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_acknowledgment"}
+            )
+            return
+        try:
+            acknowledgment = acknowledge_critical_error(
+                self.server.config.database_path,
+                server_id=server_id,
+                rule=rule,
+                actor=viewer.login,
+                now=health_now(),
+            )
+        except ValueError:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_acknowledgment"}
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK, {"acknowledgment": acknowledgment}
+        )
 
     def _health_evaluation(
         self, server: RegisteredServer
@@ -1402,6 +1479,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if (
                 server is None
                 or metric not in HISTORY_METRICS
+                or (
+                    metric == "critical-errors"
+                    and viewer.role is not Role.LAB_ADMINISTRATOR
+                )
                 or (
                     metric.startswith("gpu-")
                     and not _server_has_gpu(server)

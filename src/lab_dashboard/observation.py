@@ -9,6 +9,7 @@ from pathlib import Path
 
 from lab_dashboard.database import (
     ObservationTarget,
+    expire_collector_certificates,
     list_active_observation_targets,
     list_registered_servers,
     profile_persistent_mountpoints,
@@ -39,7 +40,13 @@ OBSERVATION_METRICS = {
     "temperature-headroom": (
         {"node_hwmon_temp_celsius", "node_thermal_zone_temp"},
     ),
-    "critical-errors": ({"lab_critical_errors_total"},),
+    "critical-errors": (
+        {"node_vmstat_oom_kill"},
+        {"node_filesystem_readonly"},
+        {"lab_health_observer_last_success_unixtime"},
+        {"lab_health_evidence_available"},
+        {"node_textfile_scrape_error"},
+    ),
     "gpu-utilization": ({"DCGM_FI_DEV_GPU_UTIL"},),
     "gpu-vram": (
         {"DCGM_FI_DEV_FB_USED"},
@@ -114,24 +121,31 @@ class ObservationEngine:
             )
 
     def _evaluate_active_health(self) -> None:
+        expire_collector_certificates(self._database_path)
         for server in list_registered_servers(self._database_path):
-            if server.enrollment_state != "active":
+            if server.enrollment_state not in (
+                "active",
+                "re-enrollment-required",
+            ):
                 continue
             mountpoints = profile_persistent_mountpoints(server)
-            try:
-                observation = current_health_observation(
-                    self._prometheus_url,
-                    server.server_id,
-                    mountpoints,
-                    required_observations=profile_required_observations(
-                        server
-                    ),
-                    required_services=profile_required_services(server),
-                    temperature_sensors=profile_temperature_sensors(server),
-                    expected_gpu_count=profile_expected_gpu_count(server),
-                )
-            except PrometheusUnavailable:
+            if server.enrollment_state == "re-enrollment-required":
                 observation = unavailable_health_observation(mountpoints)
+            else:
+                try:
+                    observation = current_health_observation(
+                        self._prometheus_url,
+                        server.server_id,
+                        mountpoints,
+                        required_observations=profile_required_observations(
+                            server
+                        ),
+                        required_services=profile_required_services(server),
+                        temperature_sensors=profile_temperature_sensors(server),
+                        expected_gpu_count=profile_expected_gpu_count(server),
+                    )
+                except PrometheusUnavailable:
+                    observation = unavailable_health_observation(mountpoints)
             evaluate_server_health(
                 self._database_path,
                 server_id=server.server_id,

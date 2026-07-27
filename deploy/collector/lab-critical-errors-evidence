@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Collect allowlisted host evidence using only fixed local inputs."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+IO_ERROR = re.compile(
+    r"\b(?:I/O error|Buffer I/O error|blk_update_request)\b.*?\b(dev|device)\s+([A-Za-z0-9_.-]+)",
+    re.IGNORECASE,
+)
+PANIC = re.compile(r"\b(?:Kernel panic|watchdog:.*lockup)\b", re.IGNORECASE)
+
+
+def journal(*arguments: str) -> tuple[bool, list[str]]:
+    result = subprocess.run(
+        ["journalctl", "--quiet", "--no-pager", *arguments],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "SYSTEMD_COLORS": "0"},
+    )
+    return result.returncode == 0, result.stdout.splitlines()
+
+
+def identity(source: str, line: str) -> str:
+    return f"{source}:{hashlib.sha256(line.encode()).hexdigest()[:24]}"
+
+
+def main() -> int:
+    output = Path("/var/lib/lab-critical-errors/evidence.json")
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    journal_available, kernel_lines = journal("-k", "--boot")
+    previous_available, previous_lines = journal("-k", "--boot=-1")
+    storage = []
+    for line in kernel_lines:
+        match = IO_ERROR.search(line)
+        if match is not None:
+            storage.append(
+                {
+                    "id": identity("journal", line),
+                    "class": "kernel",
+                    "device": match.group(2)[:128],
+                }
+            )
+    pstore_files = sorted(Path("/sys/fs/pstore").glob("*"))
+    pstore_available = Path("/sys/fs/pstore").is_dir()
+    panic_lines = previous_lines + [
+        path.read_text(errors="replace") for path in pstore_files if path.is_file()
+    ]
+    panic_evidence = next((line for line in panic_lines if PANIC.search(line)), None)
+    watchdog_paths = sorted(Path("/sys/class/watchdog").glob("watchdog*/bootstatus"))
+    watchdog_available = bool(watchdog_paths)
+    watchdog_value = next(
+        (
+            path.read_text().strip()
+            for path in watchdog_paths
+            if path.read_text().strip() not in {"", "0"}
+        ),
+        None,
+    )
+    document = {
+        "bootId": boot_id,
+        "storageIoErrors": storage,
+        "previousPanic": {
+            "detected": panic_evidence is not None,
+            "id": identity("panic", panic_evidence or "none"),
+        },
+        "watchdogReset": {
+            "detected": watchdog_value is not None,
+            "id": identity("watchdog", watchdog_value or "none"),
+        },
+        "availability": {
+            "journal": journal_available,
+            "pstore": pstore_available or previous_available,
+            "watchdog": watchdog_available,
+        },
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".evidence.", dir=output.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(document, stream, separators=(",", ":"), sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, output)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

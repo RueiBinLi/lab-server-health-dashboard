@@ -16,6 +16,7 @@ from lab_dashboard.database import (
     list_active_observation_targets,
 )
 from lab_dashboard.health import (
+    CriticalErrorHealthObservation,
     FilesystemHealthObservation,
     HealthObservation,
     RequiredServiceHealthObservation,
@@ -27,7 +28,14 @@ from lab_dashboard.health import (
 SCRAPE_INTERVAL_SECONDS = 30
 FRESH_AFTER_SECONDS = 3 * SCRAPE_INTERVAL_SECONDS
 MAX_HISTORY = timedelta(days=30)
-HISTORY_METRICS = {"cpu", "system-memory", "disk", "gpu-utilization", "gpu-vram"}
+HISTORY_METRICS = {
+    "cpu",
+    "system-memory",
+    "disk",
+    "gpu-utilization",
+    "gpu-vram",
+    "critical-errors",
+}
 # NVIDIA XIDs whose catalog action indicates a severe GPU, memory, PCIe,
 # containment, or row-remapping fault. Other diagnostic XIDs remain metrics
 # but are not promoted to the Critical Error allowlist.
@@ -203,6 +211,13 @@ def current_health_observation(
                 ),
             }
         )
+    critical_errors = (
+        _critical_error_observation(
+            prometheus_url, server_id=server_id, mountpoints=mountpoints
+        )
+        if "critical-errors" in required_observations
+        else None
+    )
     gpu_observations: list[GpuHealthObservation] = []
     gpu_uuids = (
         _instant_label_values(
@@ -271,6 +286,15 @@ def current_health_observation(
             and filesystem["exhaustionWithin24Hours"] is not None
             for filesystem in filesystems
         )
+        and (
+            "critical-errors" not in required_observations
+            or critical_errors is not None
+            and all(
+                value is not None
+                for key, value in critical_errors.items()
+                if key != "readOnlyFilesystems"
+            )
+        )
         and all(
             _required_observation_present(
                 prometheus_url,
@@ -305,7 +329,7 @@ def current_health_observation(
             )
         )
     )
-    return {
+    result: HealthObservation = {
         "primaryTelemetrySuccessful": primary_successful,
         "requiredObservationsComplete": required_complete,
         "cpuUsedPercent": _rounded(cpu),
@@ -317,11 +341,111 @@ def current_health_observation(
         "gpus": gpu_observations,
         "gpuCoverageExpected": expected_gpu_count is not None,
     }
+    if critical_errors is not None:
+        result["criticalErrors"] = critical_errors
+    return result
 
 
-def _event_increased(prometheus_url: str, expression: str) -> bool | None:
-    value = _instant_value(prometheus_url, f"increase({expression}[5m])")
-    return None if value is None else value > 0
+def _critical_error_observation(
+    prometheus_url: str,
+    *,
+    server_id: str,
+    mountpoints: tuple[str, ...],
+) -> CriticalErrorHealthObservation:
+    read_only_filesystems = [
+        mountpoint
+        for mountpoint in mountpoints
+        if _instant_value(
+            prometheus_url,
+            (
+                "max(node_filesystem_readonly"
+                f'{{server_id="{server_id}",mountpoint="{_label(mountpoint)}",'
+                'fstype!~"tmpfs|overlay|squashfs"})'
+            ),
+        )
+        == 1
+    ]
+    helper_age = _instant_value(
+        prometheus_url,
+        (
+            "time() - lab_health_observer_last_success_unixtime"
+            f'{{server_id="{server_id}",observer="critical-errors"}}'
+        ),
+    )
+    evidence_available = _instant_value(
+        prometheus_url,
+        (
+            "min(lab_health_evidence_available"
+            f'{{server_id="{server_id}",source=~"journal|pstore|watchdog"}})'
+        ),
+    )
+    textfile_error = _instant_value(
+        prometheus_url,
+        f'node_textfile_scrape_error{{server_id="{server_id}"}}',
+    )
+    return {
+        "oomKillEvent": _event_increased(
+            prometheus_url,
+            f'node_vmstat_oom_kill{{server_id="{server_id}"}}',
+            window="1m",
+        ),
+        "readOnlyFilesystems": read_only_filesystems,
+        "storageIoErrorEvent": _event_increased(
+            prometheus_url,
+            (
+                "lab_health_latest_event_unixtime"
+                f'{{server_id="{server_id}",type="storage-io-error"}}'
+            ),
+            event_timestamp=True,
+        ),
+        "previousPanicEvent": _event_increased(
+            prometheus_url,
+            (
+                "lab_health_latest_event_unixtime"
+                f'{{server_id="{server_id}",type="previous-panic"}}'
+            ),
+            event_timestamp=True,
+        ),
+        "watchdogResetEvent": _event_increased(
+            prometheus_url,
+            (
+                "lab_health_latest_event_unixtime"
+                f'{{server_id="{server_id}",type="watchdog-reset"}}'
+            ),
+            event_timestamp=True,
+        ),
+        "helperFresh": helper_age is not None and helper_age <= 90,
+        "evidenceAvailable": (
+            evidence_available is not None and evidence_available == 1
+        ),
+        "textfileScrapeSuccessful": (
+            textfile_error is not None and textfile_error == 0
+        ),
+    }
+
+
+def _event_increased(
+    prometheus_url: str,
+    expression: str,
+    *,
+    window: str = "5m",
+    event_timestamp: bool = False,
+) -> bool | None:
+    value = _instant_value(
+        prometheus_url,
+        (
+            f"time() - {expression}"
+            if event_timestamp
+            else f"increase({expression}[{window}])"
+        ),
+    )
+    return (
+        None
+        if value is None and not event_timestamp
+        else value is not None and 0 <= value <= 60
+        if event_timestamp
+        else value > 0
+    )
 
 
 def _required_observation_present(
@@ -353,7 +477,14 @@ def _required_observation_present(
             f'node_thermal_zone_temp",server_id="{server_id}"}}',
         ),
         "critical-errors": (
-            f'lab_critical_errors_total{{server_id="{server_id}"}}',
+            f'node_vmstat_oom_kill{{server_id="{server_id}"}}',
+            f'node_filesystem_readonly{{server_id="{server_id}"}}',
+            (
+                "lab_health_observer_last_success_unixtime"
+                f'{{server_id="{server_id}",observer="critical-errors"}}'
+            ),
+            f'lab_health_evidence_available{{server_id="{server_id}"}}',
+            f'node_textfile_scrape_error{{server_id="{server_id}"}}',
         ),
         "gpu-utilization": (
             f'DCGM_FI_DEV_GPU_UTIL{{server_id="{server_id}"}}',
@@ -596,6 +727,16 @@ def query_metric_history(
             "sum(DCGM_FI_DEV_FB_RESERVED"
             f'{{server_id="{server_id}"}}))'
         ),
+        "critical-errors": (
+            "sum(node_vmstat_oom_kill"
+            f'{{server_id="{server_id}"}}) + '
+            "sum(lab_health_storage_io_errors_total"
+            f'{{server_id="{server_id}"}}) + '
+            "sum(lab_health_previous_panic_events_total"
+            f'{{server_id="{server_id}"}}) + '
+            "sum(lab_health_watchdog_reset_events_total"
+            f'{{server_id="{server_id}"}})'
+        ),
     }
     points = _range_values(
         prometheus_url,
@@ -606,7 +747,7 @@ def query_metric_history(
     )
     return {
         "metric": metric,
-        "unit": "percent",
+        "unit": "count" if metric == "critical-errors" else "percent",
         "points": [
             {"observedAt": observed_at.isoformat(), "value": value}
             for observed_at, value in points

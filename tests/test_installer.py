@@ -21,7 +21,7 @@ class CollectorInstallerTests(unittest.TestCase):
         self.assertIn('"disks": disks', source)
         self.assertIn('"gpus": gpus', source)
         self.assertIn('"stableIdentifiers": stable_identifiers', source)
-        self.assertIn("lab_critical_errors_total", source)
+        self.assertIn("lab-critical-errors-helper", source)
         self.assertIn("DCGM_FI_DEV_GPU_UTIL", source)
         self.assertIn("--collector.textfile.directory", source)
         self.assertIn("lab-collector-textfile.timer", source)

@@ -6,6 +6,8 @@ NODE_EXPORTER_VERSION=1.11.1
 DCGM_EXPORTER_VERSION=4.4.1-4.7.0
 NODE_EXPORTER_AMD64_SHA256=9f5ea48e5bc7b656f8a91a32e7d7deb89f70f73dabd0d974418aca15f37d6810
 NODE_EXPORTER_ARM64_SHA256=ba1886efbd76cb96b0087c695ea8d1b9cb6e8aa946c996d744e9ee16c8e3591a
+CRITICAL_EVIDENCE_SHA256=c73df99ff7ee35ddc0cf192d61fcaa7d7bf8d27b1bb9f11e2b9726d5fb6cce3a
+CRITICAL_HELPER_SHA256=cf1092b02d57de991a22f4d7db1d9beba74e2ea3419daa90644bbe41c529c2e6
 
 fail() {
   echo "collector installer: $*" >&2
@@ -258,28 +260,40 @@ chmod 0600 /etc/lab-collector/private/collector.crt
 chmod 0644 /etc/lab-collector/collector-ca.crt
 chmod 0644 /etc/lab-collector/scrape-client-ca.crt
 
-install -d -m 0755 -o lab-node-exporter -g lab-node-exporter \
+install -d -m 0755 -o root -g root \
   /var/lib/lab-node-exporter/textfile
+install -d -m 0700 -o root -g root /var/lib/lab-critical-errors
+for asset in lab-critical-errors-evidence lab-critical-errors-helper; do
+  curl --fail --location --proto '=https' --tlsv1.2 \
+    "${LAB_ENROLLMENT_URL%/}/api/collector-assets/$asset" \
+    --output "$temporary_directory/$asset"
+done
+printf '%s  %s\n' "$CRITICAL_EVIDENCE_SHA256" \
+  "$temporary_directory/lab-critical-errors-evidence" \
+  | sha256sum --check --status \
+  || fail "Critical Error evidence collector checksum verification failed"
+printf '%s  %s\n' "$CRITICAL_HELPER_SHA256" \
+  "$temporary_directory/lab-critical-errors-helper" \
+  | sha256sum --check --status \
+  || fail "Critical Error helper checksum verification failed"
+install -m 0755 "$temporary_directory/lab-critical-errors-evidence" \
+  /usr/local/libexec/lab-critical-errors-evidence
+install -m 0755 "$temporary_directory/lab-critical-errors-helper" \
+  /usr/local/libexec/lab-critical-errors-helper
 cat >/usr/local/bin/lab-collector-textfile <<'TEXTFILE_COLLECTOR'
 #!/usr/bin/env bash
 set -euo pipefail
 
 directory=/var/lib/lab-node-exporter/textfile
-temporary="$directory/enrollment.prom.$$"
-critical_errors=$(
-  journalctl --boot --priority=crit --quiet --no-pager 2>/dev/null \
-    | wc -l || true
-)
-printf 'lab_critical_errors_total %d\n' "$critical_errors" >"$temporary"
-# Reset evidence is supplied only by a platform-specific definitive source.
-# The default collector deliberately emits no inferred reset metric from XIDs
-# or temporary device disappearance.
+# A platform adapter may provide definitive GPU reset counters separately.
 : "${LAB_GPU_RESET_METRICS_FILE:=/var/lib/lab-collector/gpu-resets.prom}"
 if [[ -r "$LAB_GPU_RESET_METRICS_FILE" ]]; then
+  gpu_temporary="$directory/gpu-resets.prom.$$"
   grep '^lab_health_gpu_resets_total{' "$LAB_GPU_RESET_METRICS_FILE" \
-    >>"$temporary" || true
+    >"$gpu_temporary" || true
+  chmod 0644 "$gpu_temporary"
+  mv "$gpu_temporary" "$directory/gpu-resets.prom"
 fi
-
 dcgm_temporary="$directory/dcgm.prom.$$"
 if curl --fail --silent --max-time 5 http://127.0.0.1:9400/metrics \
   | awk '/^# (HELP|TYPE) DCGM_|^DCGM_/' >"$dcgm_temporary"; then
@@ -289,8 +303,6 @@ else
   rm -f "$dcgm_temporary"
 fi
 
-chmod 0644 "$temporary"
-mv "$temporary" "$directory/enrollment.prom"
 TEXTFILE_COLLECTOR
 chmod 0755 /usr/local/bin/lab-collector-textfile
 /usr/local/bin/lab-collector-textfile
@@ -357,6 +369,41 @@ Type=oneshot
 ExecStart=/usr/local/bin/lab-collector-textfile
 UNIT
 
+cat >/etc/systemd/system/lab-critical-errors.service <<'UNIT'
+[Unit]
+Description=Observe allowlisted Lab Server Health Critical Errors
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/lab-critical-errors-evidence
+ExecStart=/usr/local/libexec/lab-critical-errors-helper --evidence /var/lib/lab-critical-errors/evidence.json --state /var/lib/lab-critical-errors/state.json --output /var/lib/lab-node-exporter/textfile/critical-errors.prom
+User=root
+Group=root
+PrivateNetwork=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/lab-critical-errors /var/lib/lab-node-exporter/textfile
+UNIT
+
+cat >/etc/systemd/system/lab-critical-errors.timer <<'UNIT'
+[Unit]
+Description=Refresh Lab Server Health Critical Error evidence
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 cat >/etc/systemd/system/lab-collector-textfile.timer <<'UNIT'
 [Unit]
 Description=Refresh Lab Server Health collector metrics
@@ -376,4 +423,5 @@ if [[ $requires_nvidia == 1 ]]; then
   systemctl enable --now lab-dcgm-exporter.service
 fi
 systemctl enable --now lab-collector-textfile.timer
+systemctl enable --now lab-critical-errors.timer
 echo "collector bootstrap complete; server is Pending Verification"

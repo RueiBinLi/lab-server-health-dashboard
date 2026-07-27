@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Publish bounded, durable Critical Error metrics for node_exporter."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+LABEL = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
+SOURCES = ("journal", "pstore", "watchdog")
+
+
+def bounded(value: object) -> str:
+    if not isinstance(value, str) or LABEL.fullmatch(value) is None:
+        raise ValueError("invalid bounded label")
+    return value
+
+
+def load_object(path: Path, *, missing: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return missing
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError("document must be an object")
+    return value
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--now", type=int, default=None)
+    args = parser.parse_args()
+    evidence = load_object(args.evidence, missing={})
+    state = load_object(
+        args.state, missing={"seen": [], "counters": {}, "latest": {}}
+    )
+    seen = set(state.get("seen", []))
+    counters = state.get("counters", {})
+    if not isinstance(counters, dict):
+        raise ValueError("invalid counters")
+    latest = state.get("latest", {})
+    if not isinstance(latest, dict):
+        raise ValueError("invalid latest event state")
+    boot_id = bounded(evidence.get("bootId"))
+    now = args.now if args.now is not None else int(time.time())
+
+    items = evidence.get("storageIoErrors", [])
+    if not isinstance(items, list):
+        raise ValueError("invalid storage evidence")
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("invalid storage event")
+        identity = f"{boot_id}:storage:{bounded(item.get('id'))}"
+        labels = (bounded(item.get("class")), bounded(item.get("device")))
+        key = f"storage|{labels[0]}|{labels[1]}"
+        if identity not in seen:
+            counters[key] = int(counters.get(key, 0)) + 1
+            latest["storage-io-error"] = now
+            seen.add(identity)
+
+    for evidence_key, counter_key in (
+        ("previousPanic", "panic"),
+        ("watchdogReset", "watchdog"),
+    ):
+        event = evidence.get(evidence_key, {})
+        if not isinstance(event, dict):
+            raise ValueError("invalid event evidence")
+        if event.get("detected") is True:
+            identity = (
+                f"{boot_id}:watchdog:{bounded(event.get('id'))}"
+                if counter_key == "watchdog"
+                else f"panic:{bounded(event.get('id'))}"
+            )
+            if identity not in seen:
+                counters[counter_key] = int(counters.get(counter_key, 0)) + 1
+                latest[
+                    "watchdog-reset"
+                    if counter_key == "watchdog"
+                    else "previous-panic"
+                ] = now
+                seen.add(identity)
+
+    availability = evidence.get("availability", {})
+    if not isinstance(availability, dict):
+        raise ValueError("invalid availability")
+    lines = [
+        "# HELP lab_health_observer_last_success_unixtime Last successful helper run.",
+        "# TYPE lab_health_observer_last_success_unixtime gauge",
+        f'lab_health_observer_last_success_unixtime{{observer="critical-errors"}} {now}',
+    ]
+    for key, count in sorted(counters.items()):
+        if not key.startswith("storage|"):
+            continue
+        _, error_class, device = key.split("|", 2)
+        lines.append(
+            'lab_health_storage_io_errors_total'
+            f'{{class="{error_class}",device="{device}"}} {int(count)}'
+        )
+    lines.extend(
+        [
+            f"lab_health_previous_panic_events_total {int(counters.get('panic', 0))}",
+            f"lab_health_watchdog_reset_events_total {int(counters.get('watchdog', 0))}",
+        ]
+    )
+    for source in SOURCES:
+        lines.append(
+            f'lab_health_evidence_available{{source="{source}"}} '
+            f"{1 if availability.get(source) is True else 0}"
+        )
+    for event_type, occurred_at in sorted(latest.items()):
+        bounded(event_type)
+        lines.append(
+            'lab_health_latest_event_unixtime'
+            f'{{type="{event_type}"}} {int(occurred_at)}'
+        )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.state.parent.mkdir(parents=True, exist_ok=True)
+    next_state = {
+        "seen": sorted(seen),
+        "counters": counters,
+        "latest": latest,
+    }
+    for destination, content in (
+        (args.state, json.dumps(next_state, separators=(",", ":"), sort_keys=True) + "\n"),
+        (args.output, "\n".join(lines) + "\n"),
+    ):
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.", dir=destination.parent
+        )
+        try:
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600 if destination == args.state else 0o644)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
