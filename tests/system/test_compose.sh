@@ -13,7 +13,9 @@ cleanup() {
 trap cleanup EXIT
 
 docker compose up --detach --build --wait
-python3 tests/system/assert_http.py "http://127.0.0.1:$DASHBOARD_PORT"
+server_id="$(
+  python3 tests/system/assert_http.py "http://127.0.0.1:$DASHBOARD_PORT"
+)"
 
 database_mode="$(
   docker compose exec -T dashboard python -c \
@@ -29,4 +31,5 @@ container_logs="$(docker compose logs --no-color dashboard)"
 
 docker compose stop
 docker compose start --wait
-python3 tests/system/assert_http.py "http://127.0.0.1:$DASHBOARD_PORT"
+python3 tests/system/assert_http.py \
+  "http://127.0.0.1:$DASHBOARD_PORT" "$server_id"

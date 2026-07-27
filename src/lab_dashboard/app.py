@@ -4,11 +4,31 @@ import json
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from uuid import uuid4
 
-from lab_dashboard.auth import Viewer, authorize
+from lab_dashboard.auth import Role, Viewer, authorize
 from lab_dashboard.config import DashboardConfig
-from lab_dashboard.database import initialize_database, is_ready
+from lab_dashboard.database import (
+    DisplayNameConflict,
+    ProfileNotPublished,
+    RegisteredServer,
+    initialize_database,
+    is_ready,
+    list_audit_events,
+    list_published_profiles,
+    list_registered_servers,
+    record_failed_registration,
+    register_server,
+)
+from lab_dashboard.enrollment import (
+    InvalidRegistration,
+    parse_registration,
+    safe_audit_reason,
+)
 from lab_dashboard.presentation import empty_fleet_experience
+
+
+MAX_REQUEST_BODY_BYTES = 16_384
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -37,8 +57,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/api/fleet":
             self._send_fleet()
             return
+        if self.path == "/api/server-profiles":
+            self._send_server_profiles()
+            return
+        if self.path == "/api/audit-events":
+            self._send_audit_events()
+            return
         if self.path == "/":
             self._send_dashboard()
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        if self.path == "/api/servers":
+            self._register_server()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -52,6 +84,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         experience = empty_fleet_experience(viewer.role)
+        fleet = (
+            [
+                self._administrator_server_response(server)
+                for server in list_registered_servers(
+                    self.server.config.database_path
+                )
+            ]
+            if viewer.role is Role.LAB_ADMINISTRATOR
+            else []
+        )
         self._send_json(
             HTTPStatus.OK,
             {
@@ -59,10 +101,147 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "login": viewer.login,
                     "role": viewer.role.value,
                 },
-                "fleet": [],
+                "fleet": fleet,
                 "emptyMessage": experience.message,
             },
         )
+
+    def _send_server_profiles(self) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        profiles = list_published_profiles(self.server.config.database_path)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "profiles": [
+                    {
+                        "profileId": profile.profile_id,
+                        "name": profile.name,
+                        "revision": profile.revision,
+                        "state": profile.state,
+                        "definition": profile.definition,
+                    }
+                    for profile in profiles
+                ]
+            },
+        )
+
+    def _send_audit_events(self) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "events": list_audit_events(
+                    self.server.config.database_path
+                )
+            },
+        )
+
+    def _register_server(self) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        server_id = str(uuid4())
+        try:
+            registration = parse_registration(document)
+        except InvalidRegistration:
+            record_failed_registration(
+                self.server.config.database_path,
+                actor=viewer.login,
+                server_id=server_id,
+                reason=safe_audit_reason(document),
+                result="invalid-registration",
+            )
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_registration"}
+            )
+            return
+
+        try:
+            server = register_server(
+                self.server.config.database_path,
+                server_id=server_id,
+                display_name=registration.display_name,
+                scrape_address=registration.scrape_address,
+                profile_id=registration.profile_id,
+                actor=viewer.login,
+                reason=registration.reason,
+            )
+        except DisplayNameConflict:
+            record_failed_registration(
+                self.server.config.database_path,
+                actor=viewer.login,
+                server_id=server_id,
+                reason=registration.reason,
+                result="display-name-conflict",
+            )
+            self._send_json(
+                HTTPStatus.CONFLICT, {"error": "display_name_conflict"}
+            )
+            return
+        except ProfileNotPublished:
+            record_failed_registration(
+                self.server.config.database_path,
+                actor=viewer.login,
+                server_id=server_id,
+                reason=registration.reason,
+                result="profile-not-published",
+            )
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "profile_not_published"},
+            )
+            return
+
+        self._send_json(
+            HTTPStatus.CREATED,
+            {"server": self._administrator_server_response(server)},
+        )
+
+    def _lab_administrator(self) -> Viewer | None:
+        viewer = self._authorized_viewer()
+        if viewer is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"})
+            return None
+        if viewer.role is not Role.LAB_ADMINISTRATOR:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"})
+            return None
+        return viewer
+
+    def _read_json(self) -> object:
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return None
+        if not 0 < content_length <= MAX_REQUEST_BODY_BYTES:
+            return None
+        try:
+            return json.loads(self.rfile.read(content_length))
+        except (json.JSONDecodeError, UnicodeError):
+            return None
+
+    @staticmethod
+    def _administrator_server_response(
+        server: RegisteredServer,
+    ) -> dict[str, object]:
+        return {
+            "serverId": server.server_id,
+            "displayName": server.display_name,
+            "scrapeAddress": server.scrape_address,
+            "profile": {
+                "profileId": server.profile.profile_id,
+                "name": server.profile.name,
+                "revision": server.profile.revision,
+            },
+            "enrollmentState": server.enrollment_state,
+            "serverHealth": None,
+            "metricHistory": [],
+            "criticalAlerts": [],
+        }
 
     def _authorized_viewer(self) -> Viewer | None:
         return authorize(
