@@ -21,6 +21,8 @@ ALERT_SMTP_TO=lab-administrators@example.com
 ALERT_SMTP_USERNAME=lab-alerts@example.com
 ALERT_SMTP_PASSWORD_PATH=/etc/lab-server-health/secrets/smtp-password
 ALERT_SLACK_WEBHOOK_PATH=/etc/lab-server-health/secrets/slack-webhook
+BACKUP_RECIPIENTS_PATH=/etc/lab-server-health/secrets/backup-recipients
+BACKUP_DESTINATION=/mnt/off-host-backups/lab-server-health
 ```
 
 Create both credential files as root-owned regular files with mode `0600`.
@@ -82,6 +84,10 @@ Tailscale Serve. Alertmanager listens only on `127.0.0.1:19093` and is likewise
 not proxied. The dashboard offers only server-scoped CPU, system-memory,
 and disk history queries to authorized viewers, rather than raw Prometheus or
 unrestricted PromQL access.
+
+Daily encrypted backup, isolated restoration, controlled upgrade, and rollback
+procedures are documented in
+[`docs/operations/stack-operations.md`](docs/operations/stack-operations.md).
 
 Verified servers are classified as Healthy, Degraded, or Unavailable from
 primary telemetry, required observation completeness, paired CPU pressure,

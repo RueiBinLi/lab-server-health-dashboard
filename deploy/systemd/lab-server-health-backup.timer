@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Lab Server Health durable-state backup
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=lab-server-health-backup.service
+
+[Install]
+WantedBy=timers.target

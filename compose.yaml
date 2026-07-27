@@ -42,6 +42,7 @@ services:
       start_period: 5s
     cpus: 0.50
     mem_limit: 256m
+    pids_limit: 128
 
   alertmanager-config:
     build:
@@ -78,6 +79,7 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    pids_limit: 64
 
   alertmanager:
     image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
@@ -109,6 +111,7 @@ services:
         condition: service_completed_successfully
     cpus: 0.25
     mem_limit: 128m
+    pids_limit: 128
 
   prometheus:
     image: prom/prometheus:v3.11.3-distroless@sha256:cff72a3f49918f41c4b5c8a6174dd8433036bebf7878120da538b3720ba3fa0d
@@ -137,6 +140,42 @@ services:
         condition: service_started
     cpus: 0.50
     mem_limit: 512m
+    pids_limit: 256
+
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lab-server-health-dashboard:0.1.0
+    user: "0:0"
+    network_mode: none
+    profiles: ["operations"]
+    entrypoint: ["python", "-m", "lab_dashboard.operations"]
+    command:
+      - backup
+      - --state-directory
+      - /var/lib/lab-dashboard
+      - --destination
+      - /var/backups/lab-server-health
+      - --recipient-file
+      - /run/secrets/backup-recipients
+    volumes:
+      - dashboard-data:/var/lib/lab-dashboard:ro
+      - type: bind
+        source: "${BACKUP_DESTINATION:?required}"
+        target: /var/backups/lab-server-health
+      - type: bind
+        source: "${BACKUP_RECIPIENTS_PATH:?required}"
+        target: /run/secrets/backup-recipients
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
 
 volumes:
   dashboard-data:
