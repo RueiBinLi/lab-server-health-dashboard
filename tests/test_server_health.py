@@ -46,6 +46,7 @@ def complete_gpu_observation() -> dict[str, object]:
             "aggregateUncorrectableEcc": 0.0,
         }
     ]
+    observation["gpuCoverageExpected"] = True
     return observation
 
 
@@ -275,6 +276,11 @@ class ServerHealthHttpTests(unittest.TestCase):
                 aggregate = self._run_health_requests(
                     dashboard, observation, now
                 )
+                observation["gpus"] = []
+                missing_coverage = self._run_health_requests(
+                    dashboard, observation, now
+                )
+                observation["gpus"] = [gpu]
                 gpu["aggregateUncorrectableEcc"] = 0.0
                 now[0] += timedelta(hours=1)
                 aggregate_persists = self._run_health_requests(
@@ -288,6 +294,7 @@ class ServerHealthHttpTests(unittest.TestCase):
         )
         self.assertEqual(xid_cleared[0], "Healthy")
         self.assertEqual(aggregate[0], "Degraded")
+        self.assertEqual(missing_coverage[0], "Degraded")
         self.assertEqual(aggregate_persists[0], "Degraded")
         self.assertEqual(
             aggregate_persists[1]["activeHealthCauses"][0]["rule"],

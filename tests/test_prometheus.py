@@ -141,6 +141,54 @@ class PrometheusIngestionTests(unittest.TestCase):
 
         self.assertEqual(observation["requiredObservationsComplete"], False)
 
+    def test_gpu_profile_validates_runtime_emission_of_custom_fields(
+        self,
+    ) -> None:
+        observed_at = datetime(2026, 7, 27, tzinfo=UTC)
+        complete_sample = (observed_at, 1.0)
+        with (
+            patch(
+                "lab_dashboard.prometheus._instant_label_values",
+                return_value=["GPU-5ee4"],
+            ),
+            patch(
+                "lab_dashboard.prometheus._instant_sample",
+                side_effect=[
+                    complete_sample,
+                    (observed_at, 25.0),
+                    (observed_at, 8.0),
+                    (observed_at, 4.0),
+                    (observed_at, 50.0),
+                    (observed_at, 750 * 1024**3),
+                    (observed_at, 75.0),
+                    (observed_at, 0.0),
+                    (observed_at, 70.0),
+                    (observed_at, 85.0),
+                    (observed_at, 0.0),
+                    None,
+                    (observed_at, 0.0),
+                    (observed_at, 0.0),
+                    (observed_at, 0.0),
+                ],
+            ) as query,
+        ):
+            observation = current_health_observation(
+                "http://127.0.0.1:9090",
+                "server-1",
+                ("/",),
+                expected_gpu_count=1,
+            )
+
+        self.assertEqual(observation["requiredObservationsComplete"], False)
+        self.assertIsNone(observation["gpus"][0]["xidEvent"])
+        self.assertTrue(
+            any(
+                'xid=~"31|32|43|45|48|63|64|74|79|92|94|95"'
+                in call.args[1]
+                for call in query.call_args_list
+            )
+        )
+
     def test_generated_jobs_preserve_per_server_mtls_and_thirty_second_scrape(
         self,
     ) -> None:

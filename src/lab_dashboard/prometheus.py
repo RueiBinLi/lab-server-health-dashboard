@@ -28,6 +28,12 @@ SCRAPE_INTERVAL_SECONDS = 30
 FRESH_AFTER_SECONDS = 3 * SCRAPE_INTERVAL_SECONDS
 MAX_HISTORY = timedelta(days=30)
 HISTORY_METRICS = {"cpu", "system-memory", "disk", "gpu-utilization", "gpu-vram"}
+# NVIDIA XIDs whose catalog action indicates a severe GPU, memory, PCIe,
+# containment, or row-remapping fault. Other diagnostic XIDs remain metrics
+# but are not promoted to the Critical Error allowlist.
+CRITICAL_GPU_XID_PATTERN = (
+    "31|32|43|45|48|63|64|74|79|92|94|95"
+)
 
 
 class PercentageUsage(TypedDict):
@@ -219,7 +225,7 @@ def current_health_observation(
         )
         thermal = _instant_value(
             prometheus_url,
-            f"increase(DCGM_FI_DEV_THERMAL_VIOLATION{{{selector}}}[10m])",
+            f"increase(DCGM_FI_DEV_THERMAL_VIOLATION{{{selector}}}[1m])",
         )
         gpu_observations.append(
             {
@@ -232,7 +238,10 @@ def current_health_observation(
                 "thermalThrottling": None if thermal is None else thermal > 0,
                 "xidEvent": _event_increased(
                     prometheus_url,
-                    f"DCGM_EXP_XID_ERRORS_TOTAL{{{selector}}}",
+                    (
+                        "DCGM_EXP_XID_ERRORS_TOTAL"
+                        f'{{{selector},xid=~"{CRITICAL_GPU_XID_PATTERN}"}}'
+                    ),
                 ),
                 "resetEvent": _event_increased(
                     prometheus_url,
@@ -244,7 +253,10 @@ def current_health_observation(
                 ),
                 "aggregateUncorrectableEcc": _instant_value(
                     prometheus_url,
-                    f"DCGM_FI_DEV_ECC_DBE_AGG_TOTAL{{{selector}}}",
+                    (
+                        "increase(DCGM_FI_DEV_ECC_DBE_AGG_TOTAL"
+                        f"{{{selector}}}[5m])"
+                    ),
                 ),
             }
         )
@@ -283,6 +295,14 @@ def current_health_observation(
         and (
             expected_gpu_count is None
             or len(gpu_observations) == expected_gpu_count
+            and all(
+                gpu["headroomCelsius"] is not None
+                and gpu["thermalThrottling"] is not None
+                and gpu["xidEvent"] is not None
+                and gpu["volatileUncorrectableEccEvent"] is not None
+                and gpu["aggregateUncorrectableEcc"] is not None
+                for gpu in gpu_observations
+            )
         )
     )
     return {
@@ -295,6 +315,7 @@ def current_health_observation(
         "requiredServices": service_observations,
         "temperatures": temperature_observations,
         "gpus": gpu_observations,
+        "gpuCoverageExpected": expected_gpu_count is not None,
     }
 
 

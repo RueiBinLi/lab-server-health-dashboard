@@ -50,6 +50,7 @@ class HealthObservation(TypedDict):
     requiredServices: NotRequired[list[RequiredServiceHealthObservation]]
     temperatures: NotRequired[list[TemperatureHealthObservation]]
     gpus: NotRequired[list[GpuHealthObservation]]
+    gpuCoverageExpected: NotRequired[bool]
     inventoryMatchesProfile: NotRequired[bool | None]
 
 
@@ -212,6 +213,15 @@ def evaluate_server_health(
             else {}
         )
         conditions = _rule_conditions(observation, threshold_overrides)
+        if observation.get("gpuCoverageExpected") is True:
+            for rule in states:
+                if rule.startswith("gpu-") and rule not in conditions:
+                    conditions[rule] = _RuleCondition(
+                        firing=None,
+                        clearing=None,
+                        firing_seconds=0,
+                        clearing_seconds=0,
+                    )
         states = {
             rule: state for rule, state in states.items() if rule in conditions
         }
@@ -471,14 +481,20 @@ def _rule_conditions(
             firing=(
                 None
                 if headroom is None or not isinstance(throttling, bool)
-                else headroom <= temperature_fire or throttling
+                else headroom <= temperature_fire
             ),
             clearing=(
                 None
                 if headroom is None or not isinstance(throttling, bool)
-                else headroom > temperature_clear and not throttling
+                else headroom > temperature_clear
             ),
             firing_seconds=5 * 60,
+            clearing_seconds=10 * 60,
+        )
+        conditions[f"gpu-thermal:{gpu_uuid}"] = _RuleCondition(
+            firing=throttling if isinstance(throttling, bool) else None,
+            clearing=not throttling if isinstance(throttling, bool) else None,
+            firing_seconds=0,
             clearing_seconds=10 * 60,
         )
         discrete_events = (
@@ -764,6 +780,7 @@ def _summary(rule: str) -> str:
         )
     gpu_summaries = {
         "gpu-temperature": "has insufficient slowdown-temperature headroom.",
+        "gpu-thermal": "reported thermal throttling.",
         "gpu-xid": "reported an NVIDIA XID Critical Error.",
         "gpu-reset": "reported a definitive reset Critical Error.",
         "gpu-ecc-volatile": "reported volatile uncorrectable ECC.",
