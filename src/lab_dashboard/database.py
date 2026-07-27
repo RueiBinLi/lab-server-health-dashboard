@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+
+
+BOOTSTRAP_TOKEN_TTL_SECONDS = 15 * 60
 
 
 GENERAL_LINUX_DEFINITION = {
@@ -87,6 +92,18 @@ class ProfileNotPublished(Exception):
     pass
 
 
+class ServerNotAwaitingFirstContact(Exception):
+    pass
+
+
+class InvalidBootstrapCredentials(Exception):
+    pass
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
@@ -137,6 +154,36 @@ def initialize_database(path: Path) -> None:
                     server_id TEXT,
                     reason TEXT NOT NULL,
                     result TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bootstrap_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    server_id TEXT NOT NULL REFERENCES servers(server_id),
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS collector_certificates (
+                    server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
+                    certificate_fingerprint TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS staging_scrape_targets (
+                    server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
+                    scrape_address TEXT NOT NULL,
+                    added_at TEXT NOT NULL,
+                    scrape_client_certificate_path TEXT NOT NULL,
+                    scrape_client_key_path TEXT NOT NULL
                 )
                 """
             )
@@ -244,7 +291,7 @@ def register_server(
     actor: str,
     reason: str,
 ) -> RegisteredServer:
-    occurred_at = datetime.now(UTC).isoformat()
+    occurred_at = _now().isoformat()
     with closing(_connect(path)) as connection:
         try:
             with connection:
@@ -282,6 +329,7 @@ def register_server(
                     connection,
                     occurred_at=occurred_at,
                     actor=actor,
+                    action="server-registration",
                     server_id=server_id,
                     reason=reason,
                     result="succeeded",
@@ -312,8 +360,9 @@ def record_failed_registration(
         with connection:
             _insert_audit_event(
                 connection,
-                occurred_at=datetime.now(UTC).isoformat(),
+                occurred_at=_now().isoformat(),
                 actor=actor,
+                action="server-registration",
                 server_id=server_id,
                 reason=reason,
                 result=result,
@@ -325,6 +374,7 @@ def _insert_audit_event(
     *,
     occurred_at: str,
     actor: str,
+    action: str,
     server_id: str | None,
     reason: str,
     result: str,
@@ -333,10 +383,270 @@ def _insert_audit_event(
         """
         INSERT INTO audit_events (
             occurred_at, actor, action, server_id, reason, result
-        ) VALUES (?, ?, 'server-registration', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (occurred_at, actor, server_id, reason, result),
+        (occurred_at, actor, action, server_id, reason, result),
     )
+
+
+def issue_bootstrap_token(
+    path: Path,
+    *,
+    server_id: str,
+    actor: str,
+    reason: str,
+) -> tuple[str, datetime, bool]:
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    issued_at = _now()
+    expires_at = issued_at + timedelta(
+        seconds=BOOTSTRAP_TOKEN_TTL_SECONDS
+    )
+    with closing(_connect(path)) as connection:
+        with connection:
+            server = connection.execute(
+                """
+                SELECT s.enrollment_state, p.definition_json
+                FROM servers AS s
+                JOIN server_profiles AS p
+                  ON p.profile_id = s.profile_id
+                 AND p.revision = s.profile_revision
+                WHERE server_id = ?
+                """,
+                (server_id,),
+            ).fetchone()
+            if (
+                server is None
+                or server["enrollment_state"] != "awaiting-first-contact"
+            ):
+                raise ServerNotAwaitingFirstContact
+            connection.execute(
+                """
+                INSERT INTO bootstrap_tokens (
+                    token_hash, server_id, expires_at
+                ) VALUES (?, ?, ?)
+                """,
+                (token_hash, server_id, expires_at.isoformat()),
+            )
+            _insert_audit_event(
+                connection,
+                occurred_at=issued_at.isoformat(),
+                actor=actor,
+                action="bootstrap-token-issued",
+                server_id=server_id,
+                reason=reason,
+                result="succeeded",
+            )
+    profile_definition = cast(
+        dict[str, object], json.loads(server["definition_json"])
+    )
+    capabilities = cast(
+        dict[str, object], profile_definition["capabilities"]
+    )
+    return token, expires_at, capabilities.get("gpu") is True
+
+
+def consume_bootstrap_token(
+    path: Path,
+    *,
+    server_id: str,
+    token: str,
+    certificate_fingerprint: str,
+    certificate_expires_at: datetime,
+    scrape_client_certificate_path: str,
+    scrape_client_key_path: str,
+) -> None:
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if not _bootstrap_token_is_usable(
+            connection,
+            server_id=server_id,
+            token_hash=token_hash,
+            occurred_at=occurred_at,
+        ):
+            connection.commit()
+            raise InvalidBootstrapCredentials
+
+        updated = connection.execute(
+            """
+            UPDATE bootstrap_tokens
+            SET consumed_at = ?
+            WHERE token_hash = ? AND consumed_at IS NULL
+            """,
+            (occurred_at.isoformat(), token_hash),
+        )
+        if updated.rowcount != 1:
+            connection.rollback()
+            raise InvalidBootstrapCredentials
+        server = connection.execute(
+            """
+            SELECT scrape_address, enrollment_state
+            FROM servers
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+        if (
+            server is None
+            or server["enrollment_state"] != "awaiting-first-contact"
+        ):
+            connection.rollback()
+            raise InvalidBootstrapCredentials
+        connection.execute(
+            """
+            UPDATE servers
+            SET enrollment_state = 'pending-verification'
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO collector_certificates (
+                server_id, certificate_fingerprint, expires_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                server_id,
+                certificate_fingerprint,
+                certificate_expires_at.isoformat(),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO staging_scrape_targets (
+                server_id, scrape_address, added_at,
+                scrape_client_certificate_path, scrape_client_key_path
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                server_id,
+                server["scrape_address"],
+                occurred_at.isoformat(),
+                scrape_client_certificate_path,
+                scrape_client_key_path,
+            ),
+        )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor="collector-bootstrap",
+            action="bootstrap-token-consumed",
+            server_id=server_id,
+            reason="First valid bootstrap use",
+            result="succeeded",
+        )
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor="collector-bootstrap",
+            action="bootstrap-succeeded",
+            server_id=server_id,
+            reason="Collector certificate issued and staged",
+            result="succeeded",
+        )
+        connection.commit()
+
+
+def validate_bootstrap_token(
+    path: Path, *, server_id: str, token: str
+) -> bool:
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    occurred_at = _now()
+    with closing(_connect(path)) as connection:
+        with connection:
+            return _bootstrap_token_is_usable(
+                connection,
+                server_id=server_id,
+                token_hash=token_hash,
+                occurred_at=occurred_at,
+            )
+
+
+def _bootstrap_token_is_usable(
+    connection: sqlite3.Connection,
+    *,
+    server_id: str,
+    token_hash: str,
+    occurred_at: datetime,
+) -> bool:
+    token_row = connection.execute(
+        """
+        SELECT expires_at, consumed_at
+        FROM bootstrap_tokens
+        WHERE token_hash = ? AND server_id = ?
+        """,
+        (token_hash, server_id),
+    ).fetchone()
+    if token_row is None or token_row["consumed_at"] is not None:
+        _record_bootstrap_failure(
+            connection, occurred_at, server_id, "invalid-credentials"
+        )
+        return False
+    if datetime.fromisoformat(token_row["expires_at"]) <= occurred_at:
+        _insert_audit_event(
+            connection,
+            occurred_at=occurred_at.isoformat(),
+            actor="collector-bootstrap",
+            action="bootstrap-token-expired",
+            server_id=server_id,
+            reason="Bootstrap token expired",
+            result="expired",
+        )
+        _record_bootstrap_failure(
+            connection, occurred_at, server_id, "expired-token"
+        )
+        return False
+    return True
+
+
+def _record_bootstrap_failure(
+    connection: sqlite3.Connection,
+    occurred_at: datetime,
+    server_id: str,
+    result: str,
+) -> None:
+    _insert_audit_event(
+        connection,
+        occurred_at=occurred_at.isoformat(),
+        actor="collector-bootstrap",
+        action="bootstrap-failed",
+        server_id=server_id,
+        reason="Collector bootstrap rejected",
+        result=result,
+    )
+
+
+def record_bootstrap_failure(
+    path: Path, *, server_id: str, result: str
+) -> None:
+    with closing(_connect(path)) as connection:
+        with connection:
+            _record_bootstrap_failure(connection, _now(), server_id, result)
+
+
+def server_requires_nvidia(path: Path, *, server_id: str) -> bool:
+    with closing(_connect(path)) as connection:
+        row = connection.execute(
+            """
+            SELECT p.definition_json
+            FROM servers AS s
+            JOIN server_profiles AS p
+              ON p.profile_id = s.profile_id
+             AND p.revision = s.profile_revision
+            WHERE s.server_id = ?
+            """,
+            (server_id,),
+        ).fetchone()
+    if row is None:
+        raise ServerNotAwaitingFirstContact
+    definition = cast(
+        dict[str, object], json.loads(row["definition_json"])
+    )
+    capabilities = cast(dict[str, object], definition["capabilities"])
+    return capabilities.get("gpu") is True
 
 
 def list_registered_servers(path: Path) -> list[RegisteredServer]:

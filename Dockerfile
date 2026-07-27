@@ -6,6 +6,7 @@ RUN groupadd --gid 65532 dashboard \
 
 WORKDIR /opt/lab-dashboard
 COPY --chown=dashboard:dashboard src/ ./src/
+COPY --chown=dashboard:dashboard deploy/collector/ ./deploy/collector/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

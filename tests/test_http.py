@@ -1,12 +1,18 @@
+import base64
+import hashlib
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 from lab_dashboard.app import create_server
 from lab_dashboard.config import DashboardConfig
@@ -22,6 +28,32 @@ def identity_headers(login: str, role: str) -> dict[str, str]:
             {CAPABILITY_NAME: [{"role": role}]}
         ),
     }
+
+
+def create_csr(directory: Path, common_name: str) -> str:
+    key_path = directory / f"{common_name}.key"
+    csr_path = directory / f"{common_name}.csr"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-new",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-subj",
+            f"/CN={common_name}",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(csr_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return csr_path.read_text()
 
 
 class RunningDashboard:
@@ -390,6 +422,327 @@ class ServerRegistrationTests(unittest.TestCase):
                 "profile-not-published",
             ],
         )
+
+
+class CollectorBootstrapTests(unittest.TestCase):
+    def test_lab_administrator_issues_one_time_fifteen_minute_token(self) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        registration = {
+            "displayName": "Compute 1",
+            "scrapeAddress": "https://192.168.10.8:9100/metrics",
+            "profileId": "general-linux",
+            "reason": "Add shared compute capacity",
+        }
+
+        with RunningDashboard() as dashboard:
+            _, registered = dashboard.post(
+                "/api/servers", registration, administrator
+            )
+            server_id = registered["server"]["serverId"]
+            status, issued = dashboard.post(
+                f"/api/servers/{server_id}/bootstrap-tokens",
+                {"reason": "Install the collector"},
+                administrator,
+            )
+            audit_status, audit = dashboard.get(
+                "/api/audit-events", administrator
+            )
+
+        self.assertEqual(status, 201)
+        self.assertRegex(
+            issued["bootstrapToken"], r"^[A-Za-z0-9_-]{40,}$"
+        )
+        self.assertEqual(issued["expiresInSeconds"], 900)
+        installer = issued["installer"]
+        self.assertEqual(installer["version"], "1.0.0")
+        self.assertFalse(installer["requiresNvidia"])
+        self.assertEqual(
+            installer["signingKeySha256"],
+            hashlib.sha256(
+                installer["signingPublicKey"].encode()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            installer["sha256"],
+            hashlib.sha256(installer["content"].encode()).hexdigest(),
+        )
+        with tempfile.TemporaryDirectory() as verification_directory:
+            directory = Path(verification_directory)
+            content_path = directory / "install.sh"
+            signature_path = directory / "install.sh.sig"
+            public_key_path = directory / "installer-signing.pub"
+            content_path.write_text(installer["content"])
+            signature_path.write_bytes(
+                base64.b64decode(installer["signature"])
+            )
+            public_key_path.write_text(installer["signingPublicKey"])
+            verified = subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-verify",
+                    "-pubin",
+                    "-inkey",
+                    str(public_key_path),
+                    "-rawin",
+                    "-in",
+                    str(content_path),
+                    "-sigfile",
+                    str(signature_path),
+                ],
+                capture_output=True,
+            )
+        self.assertEqual(verified.returncode, 0)
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit["events"][-1]["action"], "bootstrap-token-issued")
+        self.assertEqual(audit["events"][-1]["server_id"], server_id)
+        self.assertEqual(audit["events"][-1]["result"], "succeeded")
+        self.assertNotIn(issued["bootstrapToken"], json.dumps(audit))
+
+    def test_first_valid_bootstrap_consumes_token_and_stages_server(self) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        registration = {
+            "displayName": "Compute 1",
+            "scrapeAddress": "https://192.168.10.8:9100/metrics",
+            "profileId": "general-linux",
+            "reason": "Add shared compute capacity",
+        }
+
+        with tempfile.TemporaryDirectory() as key_directory:
+            with RunningDashboard() as dashboard:
+                _, registered = dashboard.post(
+                    "/api/servers", registration, administrator
+                )
+                server_id = registered["server"]["serverId"]
+                csr = create_csr(Path(key_directory), server_id)
+                _, issued = dashboard.post(
+                    f"/api/servers/{server_id}/bootstrap-tokens",
+                    {"reason": "Install the collector"},
+                    administrator,
+                )
+                request = {
+                    "serverId": server_id,
+                    "bootstrapToken": issued["bootstrapToken"],
+                    "certificateSigningRequest": csr,
+                    "hostname": "compute-1",
+                    "osRelease": "Ubuntu 24.04 LTS",
+                    "architecture": "x86_64",
+                }
+                first = dashboard.post("/api/enrollment/bootstrap", request)
+                reuse = dashboard.post("/api/enrollment/bootstrap", request)
+                _, fleet = dashboard.get("/api/fleet", administrator)
+                _, audit = dashboard.get("/api/audit-events", administrator)
+            certificate_path = Path(key_directory) / "collector.crt"
+            certificate_path.write_text(first[1]["certificate"])
+            certificate_details = subprocess.run(
+                [
+                    "openssl",
+                    "x509",
+                    "-in",
+                    str(certificate_path),
+                    "-noout",
+                    "-text",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+
+        self.assertEqual(first[0], 201)
+        self.assertIn("BEGIN CERTIFICATE", first[1]["certificate"])
+        self.assertIn("BEGIN CERTIFICATE", first[1]["caCertificate"])
+        self.assertIn(
+            "BEGIN CERTIFICATE",
+            first[1]["scrapeClientCaCertificate"],
+        )
+        self.assertEqual(first[1]["validForDays"], 30)
+        self.assertEqual(first[1]["scrapeSet"], "staging")
+        self.assertIn(f"urn:lab-server:{server_id}", certificate_details)
+        self.assertIn("TLS Web Server Authentication", certificate_details)
+        self.assertIn("TLS Web Client Authentication", certificate_details)
+        self.assertEqual(
+            reuse, (401, {"error": "invalid_bootstrap_credentials"})
+        )
+        self.assertEqual(
+            fleet["fleet"][0]["enrollmentState"], "pending-verification"
+        )
+        self.assertIsNone(fleet["fleet"][0]["serverHealth"])
+        self.assertEqual(fleet["fleet"][0]["metricHistory"], [])
+        self.assertEqual(fleet["fleet"][0]["criticalAlerts"], [])
+        serialized_audit = json.dumps(audit)
+        self.assertNotIn(issued["bootstrapToken"], serialized_audit)
+        self.assertEqual(
+            [event["action"] for event in audit["events"][-3:]],
+            [
+                "bootstrap-token-consumed",
+                "bootstrap-succeeded",
+                "bootstrap-failed",
+            ],
+        )
+
+    def test_concurrent_and_expired_token_use_fail_safely(self) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        registration = {
+            "displayName": "Compute 1",
+            "scrapeAddress": "https://192.168.10.8:9100/metrics",
+            "profileId": "general-linux",
+            "reason": "Add shared compute capacity",
+        }
+
+        with tempfile.TemporaryDirectory() as key_directory:
+            issued_at = datetime(2026, 7, 27, 2, 0, tzinfo=UTC)
+
+            with patch(
+                "lab_dashboard.database._now", return_value=issued_at
+            ):
+                with RunningDashboard() as dashboard:
+                    _, registered = dashboard.post(
+                        "/api/servers", registration, administrator
+                    )
+                    server_id = registered["server"]["serverId"]
+                    csr = create_csr(Path(key_directory), server_id)
+                    _, issued = dashboard.post(
+                        f"/api/servers/{server_id}/bootstrap-tokens",
+                        {"reason": "Install the collector"},
+                        administrator,
+                    )
+                    request = {
+                        "serverId": server_id,
+                        "bootstrapToken": issued["bootstrapToken"],
+                        "certificateSigningRequest": csr,
+                        "hostname": "compute-1",
+                        "osRelease": "Ubuntu 22.04 LTS",
+                        "architecture": "x86_64",
+                    }
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        responses = list(
+                            executor.map(
+                                lambda _: dashboard.post(
+                                    "/api/enrollment/bootstrap", request
+                                ),
+                                range(2),
+                            )
+                        )
+
+                    _, second_server = dashboard.post(
+                        "/api/servers",
+                        {**registration, "displayName": "Compute 2"},
+                        administrator,
+                    )
+                    second_server_id = second_server["server"]["serverId"]
+                    _, expiring = dashboard.post(
+                        f"/api/servers/{second_server_id}/bootstrap-tokens",
+                        {"reason": "Install the collector"},
+                        administrator,
+                    )
+                    expired_request = {
+                        **request,
+                        "serverId": second_server_id,
+                        "bootstrapToken": expiring["bootstrapToken"],
+                    }
+                    with patch(
+                        "lab_dashboard.database._now",
+                        return_value=issued_at + timedelta(minutes=16),
+                    ):
+                        expired = dashboard.post(
+                            "/api/enrollment/bootstrap", expired_request
+                        )
+                    _, audit = dashboard.get(
+                        "/api/audit-events", administrator
+                    )
+
+        self.assertEqual(
+            sorted(status for status, _ in responses), [201, 401]
+        )
+        self.assertEqual(
+            expired, (401, {"error": "invalid_bootstrap_credentials"})
+        )
+        self.assertIn(
+            "bootstrap-token-expired",
+            [event["action"] for event in audit["events"]],
+        )
+
+    def test_invalid_csr_is_audited_without_consuming_the_token(self) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        with tempfile.TemporaryDirectory() as key_directory:
+            with RunningDashboard() as dashboard:
+                _, registered = dashboard.post(
+                    "/api/servers",
+                    {
+                        "displayName": "Compute 1",
+                        "scrapeAddress": "https://192.168.10.8:9100/metrics",
+                        "profileId": "general-linux",
+                        "reason": "Add shared compute capacity",
+                    },
+                    administrator,
+                )
+                server_id = registered["server"]["serverId"]
+                _, issued = dashboard.post(
+                    f"/api/servers/{server_id}/bootstrap-tokens",
+                    {"reason": "Install the collector"},
+                    administrator,
+                )
+                status, body = dashboard.post(
+                    "/api/enrollment/bootstrap",
+                    {
+                        "serverId": server_id,
+                        "bootstrapToken": issued["bootstrapToken"],
+                        "certificateSigningRequest": create_csr(
+                            Path(key_directory), "different-server"
+                        ),
+                        "hostname": "compute-1",
+                        "osRelease": "Ubuntu 24.04 LTS",
+                        "architecture": "x86_64",
+                    },
+                )
+                _, audit = dashboard.get("/api/audit-events", administrator)
+
+        self.assertEqual(
+            (status, body),
+            (400, {"error": "invalid_certificate_signing_request"}),
+        )
+        self.assertEqual(audit["events"][-1]["action"], "bootstrap-failed")
+        self.assertEqual(audit["events"][-1]["result"], "invalid-csr")
+        self.assertNotIn(issued["bootstrapToken"], json.dumps(audit))
+
+    def test_gpu_profile_requirements_are_bound_to_the_token(self) -> None:
+        administrator = identity_headers(
+            "ada@example.com", "lab-administrator"
+        )
+        with RunningDashboard() as dashboard:
+            _, registered = dashboard.post(
+                "/api/servers",
+                {
+                    "displayName": "GPU 1",
+                    "scrapeAddress": "https://192.168.10.9:9100/metrics",
+                    "profileId": "nvidia-gpu-compute",
+                    "reason": "Add GPU capacity",
+                },
+                administrator,
+            )
+            server_id = registered["server"]["serverId"]
+            _, issued = dashboard.post(
+                f"/api/servers/{server_id}/bootstrap-tokens",
+                {"reason": "Install the collector"},
+                administrator,
+            )
+            requirements = dashboard.post(
+                "/api/enrollment/requirements",
+                {
+                    "serverId": server_id,
+                    "bootstrapToken": issued["bootstrapToken"],
+                },
+            )
+
+        self.assertEqual(requirements, (200, {"requiresNvidia": True}))
 
     def test_lab_user_cannot_access_server_enrollment_data(self) -> None:
         administrator = identity_headers(

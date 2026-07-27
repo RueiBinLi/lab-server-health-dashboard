@@ -9,21 +9,35 @@ from uuid import uuid4
 from lab_dashboard.auth import Role, Viewer, authorize
 from lab_dashboard.config import DashboardConfig
 from lab_dashboard.database import (
+    BOOTSTRAP_TOKEN_TTL_SECONDS,
     DisplayNameConflict,
+    InvalidBootstrapCredentials,
     ProfileNotPublished,
     RegisteredServer,
+    ServerNotAwaitingFirstContact,
+    consume_bootstrap_token,
     initialize_database,
+    issue_bootstrap_token,
     is_ready,
     list_audit_events,
     list_published_profiles,
     list_registered_servers,
+    record_bootstrap_failure,
     record_failed_registration,
     register_server,
+    server_requires_nvidia,
+    validate_bootstrap_token,
 )
 from lab_dashboard.enrollment import (
     InvalidRegistration,
     parse_registration,
     safe_audit_reason,
+)
+from lab_dashboard.installer import signed_installer
+from lab_dashboard.pki import (
+    CERTIFICATE_VALIDITY_DAYS,
+    InvalidCertificateSigningRequest,
+    issue_collector_certificate,
 )
 from lab_dashboard.presentation import empty_fleet_experience
 
@@ -71,6 +85,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path == "/api/servers":
             self._register_server()
+            return
+        if self.path == "/api/enrollment/bootstrap":
+            self._bootstrap_collector()
+            return
+        if self.path == "/api/enrollment/requirements":
+            self._send_enrollment_requirements()
+            return
+        prefix = "/api/servers/"
+        suffix = "/bootstrap-tokens"
+        if self.path.startswith(prefix) and self.path.endswith(suffix):
+            server_id = self.path[len(prefix) : -len(suffix)]
+            self._issue_bootstrap_token(server_id)
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -200,6 +226,175 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self._send_json(
             HTTPStatus.CREATED,
             {"server": self._administrator_server_response(server)},
+        )
+
+    def _issue_bootstrap_token(self, server_id: str) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"reason"}
+            or not isinstance(document["reason"], str)
+            or not 1 <= len(document["reason"].strip()) <= 500
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_token_request"}
+            )
+            return
+        installer = signed_installer(
+            self.server.config.database_path.parent
+        )
+        try:
+            token, expires_at, requires_nvidia = issue_bootstrap_token(
+                self.server.config.database_path,
+                server_id=server_id,
+                actor=viewer.login,
+                reason=document["reason"].strip(),
+            )
+        except ServerNotAwaitingFirstContact:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "server_not_awaiting_first_contact"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.CREATED,
+            {
+                "bootstrapToken": token,
+                "expiresAt": expires_at.isoformat(),
+                "expiresInSeconds": BOOTSTRAP_TOKEN_TTL_SECONDS,
+                "installer": {
+                    "version": installer.version,
+                    "content": installer.content,
+                    "sha256": installer.sha256,
+                    "signature": installer.signature,
+                    "signingPublicKey": installer.signing_public_key,
+                    "signingKeySha256": installer.signing_key_sha256,
+                    "requiresNvidia": requires_nvidia,
+                },
+            },
+        )
+
+    def _bootstrap_collector(self) -> None:
+        document = self._read_json()
+        required_fields = {
+            "serverId",
+            "bootstrapToken",
+            "certificateSigningRequest",
+            "hostname",
+            "osRelease",
+            "architecture",
+        }
+        if (
+            not isinstance(document, dict)
+            or set(document) != required_fields
+            or not all(
+                isinstance(document[field], str)
+                and bool(document[field].strip())
+                for field in required_fields
+            )
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_bootstrap_request"}
+            )
+            return
+        server_id = document["serverId"].strip()
+        if not validate_bootstrap_token(
+            self.server.config.database_path,
+            server_id=server_id,
+            token=document["bootstrapToken"],
+        ):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "invalid_bootstrap_credentials"},
+            )
+            return
+        try:
+            issued = issue_collector_certificate(
+                self.server.config.database_path.parent,
+                server_id=server_id,
+                csr=document["certificateSigningRequest"],
+            )
+        except InvalidCertificateSigningRequest:
+            record_bootstrap_failure(
+                self.server.config.database_path,
+                server_id=server_id,
+                result="invalid-csr",
+            )
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_certificate_signing_request"},
+            )
+            return
+        try:
+            consume_bootstrap_token(
+                self.server.config.database_path,
+                server_id=server_id,
+                token=document["bootstrapToken"],
+                certificate_fingerprint=issued.fingerprint,
+                certificate_expires_at=issued.expires_at,
+                scrape_client_certificate_path=(
+                    issued.scrape_client_certificate_path
+                ),
+                scrape_client_key_path=issued.scrape_client_key_path,
+            )
+        except InvalidBootstrapCredentials:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "invalid_bootstrap_credentials"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.CREATED,
+            {
+                "certificate": issued.certificate,
+                "caCertificate": issued.ca_certificate,
+                "scrapeClientCaCertificate": (
+                    issued.scrape_client_ca_certificate
+                ),
+                "expiresAt": issued.expires_at.isoformat(),
+                "validForDays": CERTIFICATE_VALIDITY_DAYS,
+                "scrapeSet": "staging",
+            },
+        )
+
+    def _send_enrollment_requirements(self) -> None:
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"serverId", "bootstrapToken"}
+            or not all(
+                isinstance(document[field], str)
+                and bool(document[field].strip())
+                for field in document
+            )
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_bootstrap_request"},
+            )
+            return
+        server_id = document["serverId"].strip()
+        if not validate_bootstrap_token(
+            self.server.config.database_path,
+            server_id=server_id,
+            token=document["bootstrapToken"],
+        ):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "invalid_bootstrap_credentials"},
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "requiresNvidia": server_requires_nvidia(
+                    self.server.config.database_path,
+                    server_id=server_id,
+                )
+            },
         )
 
     def _lab_administrator(self) -> Viewer | None:
