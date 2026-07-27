@@ -60,7 +60,10 @@ def validate_secret_file(
 def _channel_route(receiver: str, *, continue_: bool = False) -> dict[str, Any]:
     route: dict[str, Any] = {
         "receiver": receiver,
-        "matchers": ['alertname=~"ServerIncident|ServerIncidentRecovery"'],
+        "matchers": [
+            'alertname=~"ServerIncident|ServerIncidentRecovery|'
+            'NotificationChannelTest|NotificationChannelTestRecovery"'
+        ],
         "routes": [
             {
                 "receiver": receiver,
@@ -183,6 +186,38 @@ def build_prometheus_rules() -> dict[str, Any]:
                             "transition": "recovery",
                         },
                         "annotations": annotations,
+                    },
+                    {
+                        "alert": "NotificationChannelTest",
+                        "expr": "lab_notification_delivery_test == 1",
+                        "for": "0s",
+                        "labels": {
+                            "server_id": "delivery-test",
+                            "incident_id": "{{ $labels.delivery_test_id }}",
+                            "severity": "Degraded",
+                            "transition": "opening",
+                        },
+                        "annotations": {
+                            field: "Notification channel delivery test."
+                            for field in annotations
+                        },
+                    },
+                    {
+                        "alert": "NotificationChannelTestRecovery",
+                        "expr": (
+                            "lab_notification_delivery_test_recovery == 1"
+                        ),
+                        "for": "0s",
+                        "labels": {
+                            "server_id": "delivery-test",
+                            "incident_id": "{{ $labels.delivery_test_id }}",
+                            "severity": "Healthy",
+                            "transition": "recovery",
+                        },
+                        "annotations": {
+                            field: "Notification channel delivery test."
+                            for field in annotations
+                        },
                     },
                 ],
             }

@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
@@ -78,6 +78,15 @@ class IncidentTransition(TypedDict):
     causes: list[str]
 
 
+class MaintenanceWindow(TypedDict):
+    maintenanceWindowId: int
+    serverId: str
+    startsAt: str
+    endsAt: str
+    reason: str
+    declaredBy: str
+
+
 class ServerIncident(TypedDict):
     incidentId: int
     openedAt: str
@@ -86,6 +95,7 @@ class ServerIncident(TypedDict):
     transitions: list[IncidentTransition]
     profileId: NotRequired[str]
     profileRevision: NotRequired[int]
+    maintenanceWindows: NotRequired[list[MaintenanceWindow]]
 
 
 class ServerHealth(TypedDict):
@@ -97,6 +107,7 @@ class HealthEvaluation(TypedDict):
     serverHealth: ServerHealth
     activeHealthCauses: list[HealthCause]
     serverIncidents: list[ServerIncident]
+    maintenanceWindow: NotRequired[MaintenanceWindow | None]
 
 
 class CriticalErrorAcknowledgment(TypedDict):
@@ -177,6 +188,15 @@ def critical_alert_metrics(
             if not transitions:
                 continue
             latest = transitions[-1]
+            maintenance = _incident_maintenance(
+                connection,
+                server_id=incident["server_id"],
+                opened_at=incident["opened_at"],
+                closed_at=incident["closed_at"],
+                now=now,
+            )
+            if maintenance["active"]:
+                continue
             if incident["closed_at"] is None:
                 transition = _notification_transition(transitions)
                 causes = ", ".join(
@@ -193,13 +213,18 @@ def critical_alert_metrics(
                     causes=causes or "No active cause.",
                     duration=_duration(incident["opened_at"], now),
                     administrator_url=administrator_url,
+                    maintenance=maintenance["annotation"],
                 )
                 lines.append(f"lab_server_incident{{{identity}}} 1")
                 lines.append(f"lab_server_incident_info{{{content}}} 1")
             elif (
-                now.astimezone(UTC)
-                - datetime.fromisoformat(incident["closed_at"])
-            ).total_seconds() <= 60:
+                not maintenance["wholly_contained"]
+                and (
+                    now.astimezone(UTC)
+                    - datetime.fromisoformat(incident["closed_at"])
+                ).total_seconds()
+                <= 60
+            ):
                 identity = _alert_identity_labels(
                     incident,
                     severity="Healthy",
@@ -213,9 +238,32 @@ def critical_alert_metrics(
                         datetime.fromisoformat(incident["closed_at"]),
                     ),
                     administrator_url=administrator_url,
+                    maintenance=maintenance["annotation"],
                 )
                 lines.append(f"lab_server_incident_recovery{{{identity}}} 1")
                 lines.append(f"lab_server_incident_info{{{content}}} 1")
+        tests = connection.execute(
+            """
+            SELECT delivery_test_id, requested_at
+            FROM notification_delivery_tests
+            WHERE requested_at >= ?
+            ORDER BY delivery_test_id
+            """,
+            ((now.astimezone(UTC) - timedelta(minutes=2)).isoformat(),),
+        ).fetchall()
+        for test in tests:
+            age = (
+                now.astimezone(UTC)
+                - datetime.fromisoformat(test["requested_at"])
+            ).total_seconds()
+            metric = (
+                "lab_notification_delivery_test"
+                if age < 30
+                else "lab_notification_delivery_test_recovery"
+            )
+            lines.append(
+                f'{metric}{{delivery_test_id="{test["delivery_test_id"]}"}} 1'
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -268,6 +316,7 @@ def _alert_content_labels(
     causes: str,
     duration: str,
     administrator_url: str,
+    maintenance: str = "No active Maintenance Window.",
 ) -> str:
     values = {
         "server_id": incident["server_id"],
@@ -275,7 +324,7 @@ def _alert_content_labels(
         "server_name": incident["display_name"],
         "causes": causes,
         "duration": duration,
-        "maintenance": "No active Maintenance Window.",
+        "maintenance": maintenance,
         "administrator_url": (
             f"{administrator_url}/servers/{incident['server_id']}"
         ),
@@ -305,6 +354,34 @@ def initialize_health_database(path: Path) -> None:
                     current_health TEXT NOT NULL,
                     evaluated_at TEXT NOT NULL
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_delivery_tests (
+                    delivery_test_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    requested_at TEXT NOT NULL,
+                    requested_by TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS maintenance_windows (
+                    maintenance_window_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id TEXT NOT NULL REFERENCES servers(server_id),
+                    starts_at TEXT NOT NULL,
+                    ends_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    declared_by TEXT NOT NULL,
+                    CHECK (ends_at > starts_at)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS maintenance_windows_by_server_time
+                ON maintenance_windows(server_id, starts_at, ends_at)
                 """
             )
             connection.execute(
@@ -475,15 +552,28 @@ def evaluate_server_health(
             (server_id, encoded_states, health, now.isoformat()),
         )
         incidents = _list_incidents(connection, server_id)
+        active_maintenance = _active_maintenance_window(
+            connection, server_id=server_id, now=now
+        )
         connection.commit()
-    return {
+    result: HealthEvaluation = {
         "serverHealth": {
             "state": health,
-            "explanation": _explanation(health),
+            "explanation": (
+                _explanation(health)
+                + (
+                    " Maintenance Window active: "
+                    + active_maintenance["reason"]
+                    if active_maintenance is not None
+                    else ""
+                )
+            ),
         },
         "activeHealthCauses": causes,
         "serverIncidents": incidents,
     }
+    result["maintenanceWindow"] = active_maintenance
+    return result
 
 
 def acknowledge_critical_error(
@@ -514,6 +604,160 @@ def acknowledge_critical_error(
         "rule": rule,
         "acknowledgedAt": acknowledged_at,
         "acknowledgedBy": actor,
+    }
+
+
+def create_maintenance_window(
+    path: Path,
+    *,
+    server_id: str,
+    starts_at: datetime,
+    ends_at: datetime,
+    reason: str,
+    actor: str,
+) -> MaintenanceWindow:
+    if (
+        starts_at.tzinfo is None
+        or ends_at.tzinfo is None
+        or ends_at <= starts_at
+        or not reason.strip()
+    ):
+        raise ValueError("invalid Maintenance Window")
+    starts = starts_at.astimezone(UTC).isoformat()
+    ends = ends_at.astimezone(UTC).isoformat()
+    with closing(_connect(path)) as connection:
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO maintenance_windows (
+                    server_id, starts_at, ends_at, reason, declared_by
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (server_id, starts, ends, reason.strip(), actor),
+            )
+            window_id = cast(int, cursor.lastrowid)
+    return {
+        "maintenanceWindowId": window_id,
+        "serverId": server_id,
+        "startsAt": starts,
+        "endsAt": ends,
+        "reason": reason.strip(),
+        "declaredBy": actor,
+    }
+
+
+def create_notification_delivery_test(
+    path: Path, *, requested_at: datetime, actor: str
+) -> int:
+    if requested_at.tzinfo is None:
+        raise ValueError("delivery test time must be timezone-aware")
+    with closing(_connect(path)) as connection:
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO notification_delivery_tests (
+                    requested_at, requested_by
+                ) VALUES (?, ?)
+                """,
+                (requested_at.astimezone(UTC).isoformat(), actor),
+            )
+            return cast(int, cursor.lastrowid)
+
+
+def list_maintenance_windows(path: Path) -> list[MaintenanceWindow]:
+    with closing(_connect(path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT maintenance_window_id, server_id, starts_at, ends_at,
+                   reason, declared_by
+            FROM maintenance_windows
+            ORDER BY starts_at DESC, maintenance_window_id DESC
+            """
+        ).fetchall()
+    return [_maintenance_window_from_row(row) for row in rows]
+
+
+def _maintenance_window_from_row(row: sqlite3.Row) -> MaintenanceWindow:
+    return {
+        "maintenanceWindowId": row["maintenance_window_id"],
+        "serverId": row["server_id"],
+        "startsAt": row["starts_at"],
+        "endsAt": row["ends_at"],
+        "reason": row["reason"],
+        "declaredBy": row["declared_by"],
+    }
+
+
+def _active_maintenance_window(
+    connection: sqlite3.Connection, *, server_id: str, now: datetime
+) -> MaintenanceWindow | None:
+    row = connection.execute(
+        """
+        SELECT maintenance_window_id, server_id, starts_at, ends_at,
+               reason, declared_by
+        FROM maintenance_windows
+        WHERE server_id = ? AND starts_at <= ? AND ends_at > ?
+        ORDER BY starts_at DESC
+        LIMIT 1
+        """,
+        (server_id, now.isoformat(), now.isoformat()),
+    ).fetchone()
+    return None if row is None else _maintenance_window_from_row(row)
+
+
+def _incident_maintenance(
+    connection: sqlite3.Connection,
+    *,
+    server_id: str,
+    opened_at: str,
+    closed_at: str | None,
+    now: datetime,
+) -> dict[str, object]:
+    end = closed_at or now.astimezone(UTC).isoformat()
+    rows = connection.execute(
+        """
+        SELECT starts_at, ends_at, reason
+        FROM maintenance_windows
+        WHERE server_id = ? AND starts_at < ? AND ends_at > ?
+        ORDER BY starts_at
+        """,
+        (server_id, end, opened_at),
+    ).fetchall()
+    active = next(
+        (
+            row
+            for row in rows
+            if datetime.fromisoformat(row["starts_at"]) <= now
+            < datetime.fromisoformat(row["ends_at"])
+        ),
+        None,
+    )
+    coverage_end: str | None = None
+    wholly_contained = False
+    if closed_at is not None:
+        for row in rows:
+            if coverage_end is None:
+                if row["starts_at"] > opened_at:
+                    break
+                coverage_end = row["ends_at"]
+            elif row["starts_at"] <= coverage_end:
+                coverage_end = max(coverage_end, row["ends_at"])
+            if coverage_end >= closed_at:
+                wholly_contained = True
+                break
+    if active is not None:
+        annotation = (
+            f"Active Maintenance Window until {active['ends_at']}: "
+            f"{active['reason']}"
+        )
+    elif rows:
+        annotation = "Maintenance Window ended; incident remains active."
+    else:
+        annotation = "No active Maintenance Window."
+    return {
+        "active": active is not None,
+        "wholly_contained": wholly_contained,
+        "annotation": annotation,
     }
 
 
@@ -1057,6 +1301,22 @@ def _list_incidents(
         if row["profile_id"] is not None:
             incident["profileId"] = row["profile_id"]
             incident["profileRevision"] = row["profile_revision"]
+        maintenance_rows = connection.execute(
+            """
+            SELECT maintenance_window_id, server_id, starts_at, ends_at,
+                   reason, declared_by
+            FROM maintenance_windows
+            WHERE server_id = ?
+              AND starts_at < COALESCE(?, '9999-12-31T23:59:59+00:00')
+              AND ends_at > ?
+            ORDER BY starts_at
+            """,
+            (server_id, row["closed_at"], row["opened_at"]),
+        ).fetchall()
+        incident["maintenanceWindows"] = [
+            _maintenance_window_from_row(window)
+            for window in maintenance_rows
+        ]
         incidents.append(incident)
     return incidents
 

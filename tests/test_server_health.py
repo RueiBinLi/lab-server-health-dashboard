@@ -578,6 +578,86 @@ class ServerHealthHttpTests(unittest.TestCase):
             unavailable[1]["serverIncidents"],
         )
 
+    def test_maintenance_window_suppresses_delivery_without_changing_health(
+        self,
+    ) -> None:
+        now = [datetime(2026, 7, 27, 8, 0, tzinfo=UTC)]
+        observation = complete_observation()
+        with tempfile.TemporaryDirectory() as temporary:
+            with RunningDashboard() as dashboard:
+                server_id = activate_server(dashboard, Path(temporary))
+                created = dashboard.post(
+                    "/api/maintenance-windows",
+                    {
+                        "serverId": server_id,
+                        "startsAt": now[0].isoformat(),
+                        "endsAt": (now[0] + timedelta(hours=1)).isoformat(),
+                        "reason": "Replace a failed fan",
+                    },
+                    ADMINISTRATOR,
+                )
+                observation["primaryTelemetrySuccessful"] = False
+                self._run_health_requests(dashboard, observation, now)
+                now[0] += timedelta(minutes=2)
+                active = self._run_health_requests(
+                    dashboard, observation, now
+                )
+                with patch(
+                    "lab_dashboard.app.health_now",
+                    side_effect=lambda: now[0],
+                ):
+                    suppressed = dashboard.get_text("/metrics")
+                listed = dashboard.get(
+                    "/api/maintenance-windows", ADMINISTRATOR
+                )
+                channels = dashboard.get(
+                    "/api/notification-channels", ADMINISTRATOR
+                )
+                with patch(
+                    "lab_dashboard.app.health_now",
+                    side_effect=lambda: now[0],
+                ):
+                    delivery_test = dashboard.post(
+                        "/api/notification-channels/tests", {}, ADMINISTRATOR
+                    )
+                    delivery_test_metrics = dashboard.get_text("/metrics")
+                now[0] += timedelta(hours=1)
+                with patch(
+                    "lab_dashboard.app.health_now",
+                    side_effect=lambda: now[0],
+                ):
+                    resumed = dashboard.get_text("/metrics")
+
+        self.assertEqual(created[0], 201)
+        self.assertEqual(active[0], "Unavailable")
+        self.assertEqual(
+            active[1]["maintenanceWindow"]["reason"],
+            "Replace a failed fan",
+        )
+        self.assertIn(
+            "Maintenance Window active",
+            active[1]["serverHealth"]["explanation"],
+        )
+        self.assertNotIn("lab_server_incident{", suppressed[1])
+        self.assertEqual(
+            listed[1]["maintenanceWindows"][0]["reason"],
+            "Replace a failed fan",
+        )
+        self.assertEqual(
+            [channel["channel"] for channel in channels[1]["channels"]],
+            ["email", "slack"],
+        )
+        self.assertEqual(delivery_test[0], 202)
+        self.assertEqual(
+            delivery_test[1]["test"]["transitions"],
+            ["firing", "recovery"],
+        )
+        self.assertIn(
+            "lab_notification_delivery_test{", delivery_test_metrics[1]
+        )
+        self.assertIn("lab_server_incident{", resumed[1])
+        self.assertIn("Maintenance Window ended", resumed[1])
+
 
 if __name__ == "__main__":
     unittest.main()

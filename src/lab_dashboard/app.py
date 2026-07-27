@@ -94,12 +94,15 @@ from lab_dashboard.installer import signed_installer
 from lab_dashboard.health import (
     HealthEvaluation,
     acknowledge_critical_error,
+    create_maintenance_window,
+    create_notification_delivery_test,
     critical_alert_metrics,
     evaluate_server_health,
     health_now,
     initialize_health_database,
     is_critical_error_rule,
     list_critical_error_acknowledgments,
+    list_maintenance_windows,
 )
 from lab_dashboard.observation import (
     ObservationEngine,
@@ -269,6 +272,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/audit-events":
             self._send_audit_events()
             return
+        if path == "/api/maintenance-windows":
+            self._send_maintenance_windows()
+            return
+        if path == "/api/notification-channels":
+            self._send_notification_channels()
+            return
         collector_prefix = "/api/collectors/"
         configuration_suffix = "/profile-configuration"
         if path.startswith(collector_prefix) and path.endswith(
@@ -308,6 +317,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         path = request.path
         if path == "/api/server-profiles":
             self._clone_server_profile()
+            return
+        if path == "/api/maintenance-windows":
+            self._create_maintenance_window()
+            return
+        if path == "/api/notification-channels/tests":
+            self._test_notification_channels()
             return
         profile_prefix = "/api/server-profiles/"
         if path.startswith(profile_prefix):
@@ -1572,6 +1587,91 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return None
         return viewer
 
+    def _send_maintenance_windows(self) -> None:
+        if self._lab_administrator() is None:
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "maintenanceWindows": list_maintenance_windows(
+                    self.server.config.database_path
+                )
+            },
+        )
+
+    def _create_maintenance_window(self) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        document = self._read_json()
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"serverId", "startsAt", "endsAt", "reason"}
+            or not all(isinstance(value, str) for value in document.values())
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_maintenance_window"},
+            )
+            return
+        try:
+            window = create_maintenance_window(
+                self.server.config.database_path,
+                server_id=document["serverId"],
+                starts_at=datetime.fromisoformat(document["startsAt"]),
+                ends_at=datetime.fromisoformat(document["endsAt"]),
+                reason=document["reason"],
+                actor=viewer.login,
+            )
+        except (ValueError, KeyError):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_maintenance_window"},
+            )
+            return
+        self._send_json(HTTPStatus.CREATED, {"maintenanceWindow": window})
+
+    def _send_notification_channels(self) -> None:
+        if self._lab_administrator() is None:
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "channels": [
+                    {
+                        "channel": channel,
+                        "configured": True,
+                        "state": "configured",
+                        "lastOutcome": None,
+                    }
+                    for channel in ("email", "slack")
+                ]
+            },
+        )
+
+    def _test_notification_channels(self) -> None:
+        viewer = self._lab_administrator()
+        if viewer is None:
+            return
+        test_id = create_notification_delivery_test(
+            self.server.config.database_path,
+            requested_at=health_now(),
+            actor=viewer.login,
+        )
+        self._send_json(
+            HTTPStatus.ACCEPTED,
+            {
+                "test": {
+                    "deliveryTestId": test_id,
+                    "transitions": ["firing", "recovery"],
+                    "channels": [
+                        {"channel": channel, "state": "queued"}
+                        for channel in ("email", "slack")
+                    ],
+                }
+            },
+        )
+
     def _read_json(self) -> object:
         try:
             content_length = int(self.headers.get("Content-Length", ""))
@@ -1675,6 +1775,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             evaluation = self._health_evaluation(server)
             response["serverHealth"] = evaluation["serverHealth"]
             if role is Role.LAB_ADMINISTRATOR:
+                response["maintenanceWindow"] = evaluation.get(
+                    "maintenanceWindow"
+                )
                 response["activeHealthCauses"] = evaluation[
                     "activeHealthCauses"
                 ]
