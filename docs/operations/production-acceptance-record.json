@@ -1,0 +1,97 @@
+{
+  "recordVersion": 1,
+  "gates": [
+    {
+      "gate": 1,
+      "name": "Central LAN commissioning",
+      "result": "pending",
+      "completedAt": null,
+      "checks": [
+        {"id": "central-lan-access"},
+        {"id": "resource-limits"},
+        {"id": "protected-secrets"},
+        {"id": "component-health"},
+        {"id": "durable-persistence"},
+        {"id": "reboot-recovery"},
+        {"id": "monitored-workloads-unaffected"}
+      ]
+    },
+    {
+      "gate": 2,
+      "name": "First-server enrollment",
+      "result": "pending",
+      "completedAt": null,
+      "checks": [
+        {"id": "server-1-enrollment"},
+        {"id": "server-1-profile-observation"}
+      ]
+    },
+    {
+      "gate": 3,
+      "name": "Second-server enrollment and representative soak",
+      "result": "pending",
+      "completedAt": null,
+      "checks": [
+        {"id": "server-2-enrollment"},
+        {"id": "server-2-profile-observation"},
+        {"id": "72-hour-capacity-soak"},
+        {"id": "training-throughput"}
+      ]
+    },
+    {
+      "gate": 4,
+      "name": "Failure, recovery, and rollback exercises",
+      "result": "pending",
+      "completedAt": null,
+      "checks": [
+        {"id": "health-causes-and-precedence"},
+        {"id": "incident-transitions-and-recovery"},
+        {"id": "alert-channels-and-failure-isolation"},
+        {"id": "maintenance-window"},
+        {"id": "backup-restoration"},
+        {"id": "certificate-rotation-revocation-re-enrollment"},
+        {"id": "collector-and-central-upgrade"},
+        {"id": "collector-rollback"},
+        {"id": "central-stack-rollback"}
+      ]
+    },
+    {
+      "gate": 5,
+      "name": "Tailscale authorization and sign-off",
+      "result": "pending",
+      "completedAt": null,
+      "checks": [
+        {"id": "lab-administrator-access"},
+        {"id": "lab-user-access"},
+        {"id": "neither-role-denied"},
+        {"id": "malformed-identity-denied"},
+        {"id": "tagged-device-denied"},
+        {"id": "direct-backend-denied"},
+        {"id": "spoofed-headers-denied"}
+      ]
+    }
+  ],
+  "measurements": {
+    "soak": {
+      "continuousHours": null,
+      "projectedRetentionDays": null,
+      "swappingObserved": null,
+      "minimumDiskFreePercent": null,
+      "scrapeCadenceSeconds": null,
+      "observedMetricHistoryBytesPerHour": null,
+      "projectedMetricHistoryBytes": null,
+      "stateVolumeCapacityBytes": null,
+      "nonMetricUsedBytes": null
+    },
+    "trainingThroughput": {
+      "before": [],
+      "after": []
+    }
+  },
+  "signOff": {
+    "decision": "pending",
+    "labAdministrator": "",
+    "recordedAt": "",
+    "productionRollbackOwner": ""
+  }
+}

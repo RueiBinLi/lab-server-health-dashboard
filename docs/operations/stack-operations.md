@@ -100,3 +100,12 @@ part of collector upgrade or rollback.
 To roll a collector back explicitly, run `collector-rollback.sh`; it restores
 the exact retained package and configuration, verifies the saved hashes, and
 restarts only the collector service.
+
+## Initial production qualification
+
+Before production activation, complete the sequential two-server procedure in
+[`production-qualification.md`](production-qualification.md). Start from
+[`production-acceptance-record.json`](production-acceptance-record.json), keep
+the populated record and evidence outside the repository, and validate it with
+`python3 -m lab_dashboard.qualification`. The validator does not perform the
+real-host exercises or create operational evidence.

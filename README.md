@@ -96,6 +96,10 @@ either mode.
 Daily encrypted backup, isolated restoration, controlled upgrade, and rollback
 procedures are documented in
 [`docs/operations/stack-operations.md`](docs/operations/stack-operations.md).
+The initial two-server rollout must also pass the sequential, evidence-driven
+[`production qualification`](docs/operations/production-qualification.md);
+its machine-checkable record cannot substitute for real-host evidence or an
+accountable Lab Administrator's sign-off.
 
 Verified servers are classified as Healthy, Degraded, or Unavailable from
 primary telemetry, required observation completeness, paired CPU pressure,
