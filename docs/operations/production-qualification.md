@@ -1,7 +1,8 @@
 # Initial two-server production qualification
 
 This runbook is the five-gate production acceptance procedure for the initial
-fleet. A Lab Administrator performs it on the production-shaped LAN deployment.
+fleet. A Lab Administrator performs it on the production-shaped Ubuntu 22.04
+or 24.04 LTS LAN deployment.
 Keep evidence outside the repository in an access-controlled, non-secret
 location and copy
 `production-acceptance-record.json` there before recording results. Never put
@@ -46,6 +47,11 @@ Tailscale Serve.
 5. Compare monitored workload processes and training availability before,
    during, and after central restart and reboot. Central operations must not
    restart, pause, or reconfigure either monitored workload.
+
+When the central stack is colocated with a monitored training server, also
+record the active Compose CPU and memory limits at this gate. Colocation cannot
+pass Gate 1 unless those limits are enabled. Gate 3's throughput and swapping
+criteria then decide whether the shared host is acceptable for production.
 
 Set Gate 1 to `pass` only when all seven checks pass.
 

@@ -96,6 +96,10 @@ either mode.
 Daily encrypted backup, isolated restoration, controlled upgrade, and rollback
 procedures are documented in
 [`docs/operations/stack-operations.md`](docs/operations/stack-operations.md).
+The central stack supports Ubuntu 22.04 LTS and 24.04 LTS. A dedicated host is
+preferred; a colocated training host is accepted only with the committed
+Compose resource limits and successful production qualification, including no
+observed swapping and no more than 2% median training-throughput reduction.
 The initial two-server rollout must also pass the sequential, evidence-driven
 [`production qualification`](docs/operations/production-qualification.md);
 its machine-checkable record cannot substitute for real-host evidence or an
