@@ -25,10 +25,37 @@ REQUIRED_BACKUP_PATHS = (
 )
 BACKUP_PATHS = (*REQUIRED_BACKUP_PATHS, "generated")
 EXCLUDED_PATHS = ("prometheus-data", "offline-root-ca")
+SUPPORTED_CENTRAL_UBUNTU_RELEASES = {"22.04", "24.04"}
 
 
 class OperationsError(Exception):
     pass
+
+
+def validate_central_host_os(os_release_path: Path) -> str:
+    try:
+        values = {}
+        for line in os_release_path.read_text().splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            key, value = line.split("=", 1)
+            values[key] = value.strip().strip("\"'")
+    except OSError as error:
+        raise OperationsError(
+            f"{os_release_path}: cannot read central host OS release"
+        ) from error
+    release = values.get("VERSION_ID", "")
+    if (
+        values.get("ID") != "ubuntu"
+        or release not in SUPPORTED_CENTRAL_UBUNTU_RELEASES
+    ):
+        supported = ", ".join(sorted(SUPPORTED_CENTRAL_UBUNTU_RELEASES))
+        raise OperationsError(
+            "central host must run Ubuntu "
+            f"{supported} LTS; found "
+            f"{values.get('ID', 'unknown')} {release or 'unknown'}"
+        )
+    return release
 
 
 def validate_secret(path: Path, allowed_owners: set[int]) -> None:
@@ -312,6 +339,11 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate")
     validate.add_argument("--secret", action="append", type=Path, required=True)
+    validate.add_argument(
+        "--os-release",
+        type=Path,
+        default=Path("/etc/os-release"),
+    )
     backup = commands.add_parser("backup")
     backup.add_argument("--state-directory", type=Path, required=True)
     backup.add_argument("--destination", type=Path, required=True)
@@ -340,9 +372,17 @@ def main() -> int:
     arguments = _parser().parse_args()
     try:
         if arguments.command == "validate":
+            release = validate_central_host_os(arguments.os_release)
             for secret in arguments.secret:
                 validate_secret(secret, {0})
-            print(json.dumps({"status": "valid"}))
+            print(
+                json.dumps(
+                    {
+                        "centralHostOs": f"Ubuntu {release} LTS",
+                        "status": "valid",
+                    }
+                )
+            )
         elif arguments.command == "backup":
             archive = create_backup(
                 arguments.state_directory,

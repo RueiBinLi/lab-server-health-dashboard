@@ -1,7 +1,17 @@
 # Central stack and collector operations
 
-These procedures are for a Lab Administrator on dedicated Ubuntu 24.04 LTS
-infrastructure. The central host must not run lab workloads.
+These procedures support Ubuntu 22.04 LTS and Ubuntu 24.04 LTS. A dedicated
+central host remains preferred because it keeps monitoring available when a
+training server fails.
+
+For an initial two-server lab, the central stack may share a host with a
+training workload only when the Compose CPU and memory limits remain enabled
+and the production qualification measures the colocated workload. The stack's
+continuously running services are capped at 1.25 CPUs and 896 MiB of memory in
+total. Operations-profile jobs run only when explicitly invoked. Colocation
+must not be signed off if the representative three-run comparison shows more
+than 2% lower median training throughput, if the 72-hour soak observes swapping,
+or if central restart/reboot testing interrupts the workload.
 
 ## Deploy and validate
 

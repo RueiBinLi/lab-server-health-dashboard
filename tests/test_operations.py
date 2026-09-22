@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sqlite3
@@ -9,7 +10,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lab_dashboard.operations import OperationsError, create_backup
+from lab_dashboard.operations import (
+    OperationsError,
+    create_backup,
+    main,
+    validate_central_host_os,
+)
 
 
 class OperationsCliTests(unittest.TestCase):
@@ -38,6 +44,73 @@ class OperationsCliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("must have mode 0600", result.stderr)
+
+    def test_central_host_supports_ubuntu_22_04_and_24_04(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            os_release = Path(directory) / "os-release"
+            for release in ("22.04", "24.04"):
+                os_release.write_text(
+                    f'ID=ubuntu\nVERSION_ID="{release}"\n'
+                )
+                self.assertEqual(
+                    validate_central_host_os(os_release),
+                    release,
+                )
+
+    def test_central_host_rejects_unsupported_operating_system(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            os_release = Path(directory) / "os-release"
+            os_release.write_text('ID=debian\nVERSION_ID="13"\n')
+
+            with self.assertRaisesRegex(
+                OperationsError,
+                "central host must run Ubuntu 22.04, 24.04 LTS",
+            ):
+                validate_central_host_os(os_release)
+
+    def test_central_host_rejects_unreadable_os_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            os_release = Path(directory) / "missing-os-release"
+
+            with self.assertRaisesRegex(
+                OperationsError,
+                "cannot read central host OS release",
+            ):
+                validate_central_host_os(os_release)
+
+    def test_validate_reports_supported_central_host_os(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os_release = root / "os-release"
+            os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
+            secret = root / "secret"
+            secret.write_text("test")
+            output = io.StringIO()
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "lab_dashboard.operations",
+                        "validate",
+                        "--os-release",
+                        str(os_release),
+                        "--secret",
+                        str(secret),
+                    ],
+                ),
+                patch("lab_dashboard.operations.validate_secret"),
+                patch("sys.stdout", output),
+            ):
+                result = main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "centralHostOs": "Ubuntu 24.04 LTS",
+                "status": "valid",
+            },
+        )
 
     def test_backup_manifest_excludes_metric_history_and_offline_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
